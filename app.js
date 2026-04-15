@@ -1400,17 +1400,17 @@
     }
     if (!hotel) hotel = hotels[0];
 
-    // ========== 智能路线规划：按地理位置分配 + 最近邻排序 ==========
+    // ========== 智能路线规划：K-Means 聚类 + 最近邻 + 2-opt 优化 ==========
     // 1. 确定每天可游览的景点数
     const maxSpotsPerDay = (d) => d === 0 ? 3 : 4; // 第一天下午开始，少一些
     let totalSlots = 0;
     for (let d = 0; d < days; d++) totalSlots += maxSpotsPerDay(d);
     const usableSights = sights.slice(0, Math.min(sights.length, totalSlots));
 
-    // 2. 用 K-Means 风格的地理聚类将景点分配到每天
+    // 2. K-Means 地理聚类：按实际坐标距离将景点分成 N 天的组
     const dailySights = clusterSightsByDay(usableSights, days, hotel, arrival);
 
-    // 3. 每天内部用最近邻算法排序，起点为酒店（第一天为到达点）
+    // 3. 每天内部用最近邻 + 2-opt 优化排序，确保最短路线
     for (let d = 0; d < dailySights.length; d++) {
       const startPoint = d === 0 ? arrival : hotel;
       dailySights[d] = sortByNearestNeighbor(dailySights[d], startPoint);
@@ -1476,10 +1476,95 @@
     return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
   }
 
-  // ========== 最近邻算法：从起点出发，每次选最近的未访问景点 ==========
+  // ========== K-Means 地理聚类：将景点按实际坐标距离分成 K 组 ==========
+  // 参考 Google Maps marker clustering 和 Mapbox supercluster 的思路
+  // 使用标准 K-Means++ 初始化 + Lloyd 迭代
+  function kMeansCluster(points, k, maxIter) {
+    if (maxIter === undefined) maxIter = 50;
+    if (points.length <= k) {
+      // 景点数不超过天数，每天最多一个景点
+      return points.map(p => [p]);
+    }
+
+    // K-Means++ 初始化：选择彼此尽量远的初始质心
+    const centroids = [];
+    // 第一个质心随机选
+    centroids.push({ lat: points[0].lat, lng: points[0].lng });
+
+    for (let c = 1; c < k; c++) {
+      // 计算每个点到最近质心的距离
+      const dists = points.map(p => {
+        let minD = Infinity;
+        centroids.forEach(cen => {
+          const d = geoDistance(p.lat, p.lng, cen.lat, cen.lng);
+          if (d < minD) minD = d;
+        });
+        return minD * minD; // 距离平方作为权重
+      });
+      const totalDist = dists.reduce((s, d) => s + d, 0);
+      // 按距离加权随机选择下一个质心
+      let r = Math.random() * totalDist;
+      let chosen = 0;
+      for (let i = 0; i < dists.length; i++) {
+        r -= dists[i];
+        if (r <= 0) { chosen = i; break; }
+      }
+      centroids.push({ lat: points[chosen].lat, lng: points[chosen].lng });
+    }
+
+    // Lloyd 迭代
+    let assignments = new Array(points.length).fill(0);
+    for (let iter = 0; iter < maxIter; iter++) {
+      let changed = false;
+
+      // E 步：将每个点分配到最近的质心
+      for (let i = 0; i < points.length; i++) {
+        let bestC = 0;
+        let bestD = Infinity;
+        for (let c = 0; c < k; c++) {
+          const d = geoDistance(points[i].lat, points[i].lng, centroids[c].lat, centroids[c].lng);
+          if (d < bestD) { bestD = d; bestC = c; }
+        }
+        if (assignments[i] !== bestC) {
+          assignments[i] = bestC;
+          changed = true;
+        }
+      }
+
+      if (!changed) break; // 已收敛
+
+      // M 步：更新质心为簇内均值
+      for (let c = 0; c < k; c++) {
+        let sumLat = 0, sumLng = 0, count = 0;
+        for (let i = 0; i < points.length; i++) {
+          if (assignments[i] === c) {
+            sumLat += points[i].lat;
+            sumLng += points[i].lng;
+            count++;
+          }
+        }
+        if (count > 0) {
+          centroids[c].lat = sumLat / count;
+          centroids[c].lng = sumLng / count;
+        }
+      }
+    }
+
+    // 按分配结果分组
+    const clusters = Array.from({ length: k }, () => []);
+    for (let i = 0; i < points.length; i++) {
+      clusters[assignments[i]].push(points[i]);
+    }
+
+    return clusters;
+  }
+
+  // ========== 最近邻算法 + 2-opt 局部优化 ==========
+  // 先用最近邻生成初始路线，再用 2-opt 消除交叉
   function sortByNearestNeighbor(sights, startPoint) {
     if (sights.length <= 1) return sights;
 
+    // 第一步：最近邻贪心构造初始路线
     const sorted = [];
     const remaining = [...sights];
     let curLat = startPoint.lat;
@@ -1503,10 +1588,53 @@
       curLng = nearest.lng;
     }
 
-    return sorted;
+    // 第二步：2-opt 局部优化，消除路线交叉
+    return twoOptImprove(sorted, startPoint);
   }
 
-  // ========== 地理聚类：将景点按地理位置分配到每天 ==========
+  // 2-opt 局部搜索：反复尝试翻转子路径，直到无法改进
+  // 这是 TSP（旅行商问题）最经典的局部优化算法
+  function twoOptImprove(route, startPoint) {
+    if (route.length <= 2) return route;
+
+    // 构建包含起点的完整路径用于距离计算
+    const getPathDist = (r) => {
+      let total = geoDistance(startPoint.lat, startPoint.lng, r[0].lat, r[0].lng);
+      for (let i = 0; i < r.length - 1; i++) {
+        total += geoDistance(r[i].lat, r[i].lng, r[i + 1].lat, r[i + 1].lng);
+      }
+      return total;
+    };
+
+    let improved = true;
+    let bestDist = getPathDist(route);
+    let maxRounds = 100; // 防止极端情况死循环
+
+    while (improved && maxRounds-- > 0) {
+      improved = false;
+      for (let i = 0; i < route.length - 1; i++) {
+        for (let j = i + 1; j < route.length; j++) {
+          // 尝试翻转 route[i..j] 这段子路径
+          const newRoute = [
+            ...route.slice(0, i),
+            ...route.slice(i, j + 1).reverse(),
+            ...route.slice(j + 1)
+          ];
+          const newDist = getPathDist(newRoute);
+          if (newDist < bestDist - 0.001) { // 0.001km 容差避免浮点抖动
+            route = newRoute;
+            bestDist = newDist;
+            improved = true;
+          }
+        }
+      }
+    }
+
+    return route;
+  }
+
+  // ========== 地理聚类：将景点按实际地理位置分配到每天 ==========
+  // 使用 K-Means 聚类 + 簇间排序 + 容量均衡
   function clusterSightsByDay(sights, numDays, hotel, arrival) {
     if (sights.length === 0) return Array.from({ length: numDays }, () => []);
     if (numDays === 1) return [sights];
@@ -1514,44 +1642,121 @@
     // 每天的最大景点数
     const maxPerDay = (d) => d === 0 ? 3 : 4;
 
-    // 使用角度分区法：以酒店为中心，按角度将景点分成 numDays 个扇区
-    const centerLat = hotel.lat;
-    const centerLng = hotel.lng;
+    // 第一步：K-Means 聚类
+    let clusters = kMeansCluster(sights, numDays);
 
-    // 计算每个景点相对于酒店的角度
-    const sightsWithAngle = sights.map(s => ({
-      ...s,
-      angle: Math.atan2(s.lat - centerLat, s.lng - centerLng)
-    }));
+    // 移除空簇并重新聚类（K-Means 可能产生空簇）
+    clusters = clusters.filter(c => c.length > 0);
+    while (clusters.length < numDays && clusters.some(c => c.length > 1)) {
+      // 找到最大的簇，拆分它
+      let maxIdx = 0;
+      for (let i = 1; i < clusters.length; i++) {
+        if (clusters[i].length > clusters[maxIdx].length) maxIdx = i;
+      }
+      const big = clusters.splice(maxIdx, 1)[0];
+      const sub = kMeansCluster(big, 2);
+      clusters.push(...sub.filter(c => c.length > 0));
+    }
 
-    // 按角度排序
-    sightsWithAngle.sort((a, b) => a.angle - b.angle);
+    // 第二步：按簇质心到酒店/到达点的距离排序
+    // 第一天从到达点出发，所以离到达点最近的簇排第一天
+    const clusterCentroids = clusters.map(c => {
+      const avgLat = c.reduce((s, p) => s + p.lat, 0) / c.length;
+      const avgLng = c.reduce((s, p) => s + p.lng, 0) / c.length;
+      return { lat: avgLat, lng: avgLng };
+    });
 
-    // 均匀分配到每天
+    // 用最近邻法对簇排序：第一天从到达点出发
+    const clusterOrder = [];
+    const remainingClusters = clusters.map((c, i) => i);
+    let curPoint = { lat: arrival.lat, lng: arrival.lng };
+
+    while (remainingClusters.length > 0) {
+      let bestIdx = 0;
+      let bestDist = Infinity;
+      for (let i = 0; i < remainingClusters.length; i++) {
+        const ci = remainingClusters[i];
+        const d = geoDistance(curPoint.lat, curPoint.lng, clusterCentroids[ci].lat, clusterCentroids[ci].lng);
+        if (d < bestDist) { bestDist = d; bestIdx = i; }
+      }
+      const chosen = remainingClusters.splice(bestIdx, 1)[0];
+      clusterOrder.push(chosen);
+      curPoint = clusterCentroids[chosen];
+    }
+
+    // 第三步：将排序后的簇分配到每天，并做容量均衡
     const dailySights = Array.from({ length: numDays }, () => []);
-    let dayIdx = 0;
 
-    sightsWithAngle.forEach(s => {
-      // 找到还有空位的最近一天
-      let assigned = false;
-      for (let attempt = 0; attempt < numDays; attempt++) {
-        const idx = (dayIdx + attempt) % numDays;
-        if (dailySights[idx].length < maxPerDay(idx)) {
-          dailySights[idx].push(s);
-          assigned = true;
-          if (dailySights[idx].length >= maxPerDay(idx)) {
-            dayIdx = (idx + 1) % numDays;
-          }
-          break;
+    // 如果簇数等于天数，直接一一对应
+    if (clusterOrder.length === numDays) {
+      clusterOrder.forEach((ci, d) => {
+        dailySights[d] = clusters[ci];
+      });
+    } else if (clusterOrder.length < numDays) {
+      // 簇数少于天数，先分配，剩余天留空
+      clusterOrder.forEach((ci, d) => {
+        dailySights[d] = clusters[ci];
+      });
+    } else {
+      // 簇数多于天数（不太可能但防御性处理），合并相邻簇
+      const perDay = Math.ceil(clusterOrder.length / numDays);
+      for (let d = 0; d < numDays; d++) {
+        const start = d * perDay;
+        const end = Math.min(start + perDay, clusterOrder.length);
+        for (let i = start; i < end; i++) {
+          dailySights[d].push(...clusters[clusterOrder[i]]);
         }
       }
-      // 如果所有天都满了，加到最少的那天
-      if (!assigned) {
-        const minDay = dailySights.reduce((minIdx, arr, idx) =>
-          arr.length < dailySights[minIdx].length ? idx : minIdx, 0);
-        dailySights[minDay].push(s);
+    }
+
+    // 第四步：容量均衡 — 如果某天景点过多，将最远的景点移到最近的有空位的天
+    let balanced = false;
+    let balanceRounds = 20;
+    while (!balanced && balanceRounds-- > 0) {
+      balanced = true;
+      for (let d = 0; d < numDays; d++) {
+        const max = maxPerDay(d);
+        while (dailySights[d].length > max) {
+          balanced = false;
+          // 找到该天中离质心最远的景点
+          const centroid = {
+            lat: dailySights[d].reduce((s, p) => s + p.lat, 0) / dailySights[d].length,
+            lng: dailySights[d].reduce((s, p) => s + p.lng, 0) / dailySights[d].length
+          };
+          let farthestIdx = 0;
+          let farthestDist = 0;
+          dailySights[d].forEach((s, i) => {
+            const dist = geoDistance(s.lat, s.lng, centroid.lat, centroid.lng);
+            if (dist > farthestDist) { farthestDist = dist; farthestIdx = i; }
+          });
+          const overflow = dailySights[d].splice(farthestIdx, 1)[0];
+
+          // 找到有空位且质心最近的天
+          let bestDay = -1;
+          let bestDayDist = Infinity;
+          for (let dd = 0; dd < numDays; dd++) {
+            if (dd === d) continue;
+            if (dailySights[dd].length < maxPerDay(dd)) {
+              const ddCentroid = dailySights[dd].length > 0 ? {
+                lat: dailySights[dd].reduce((s, p) => s + p.lat, 0) / dailySights[dd].length,
+                lng: dailySights[dd].reduce((s, p) => s + p.lng, 0) / dailySights[dd].length
+              } : { lat: hotel.lat, lng: hotel.lng };
+              const dist = geoDistance(overflow.lat, overflow.lng, ddCentroid.lat, ddCentroid.lng);
+              if (dist < bestDayDist) { bestDayDist = dist; bestDay = dd; }
+            }
+          }
+          if (bestDay >= 0) {
+            dailySights[bestDay].push(overflow);
+          } else {
+            // 所有天都满了，放回最少的那天
+            const minDay = dailySights.reduce((mi, arr, idx) =>
+              arr.length < dailySights[mi].length ? idx : mi, 0);
+            dailySights[minDay].push(overflow);
+            break;
+          }
+        }
       }
-    });
+    }
 
     return dailySights;
   }
