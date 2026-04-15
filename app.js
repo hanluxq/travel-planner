@@ -822,6 +822,8 @@
         tab.classList.add('active');
         budget = tab.dataset.budget;
         updateBudgetDetail();
+        // 切换预算档位时，在地图上只显示对应价位的酒店
+        filterHotelMarkersByBudget();
       });
     });
 
@@ -1223,10 +1225,23 @@
     toggleMarkers('hotel', layerHotels.checked);
   }
 
+  // 酒店档位颜色映射：不同价位用不同颜色区分
+  const hotelColorMap = {
+    '豪华': '#a855f7', // 紫色
+    '舒适': '#f59e0b', // 琥珀色
+    '标准': '#ef4444', // 红色
+    '经济': '#22c55e'  // 绿色
+  };
+
   function createMarker(poi, category) {
     const pos = new TMap.LatLng(poi.lat, poi.lng);
-    const colorMap = { sight: '#3b82f6', hotel: '#ef4444', arrival: '#10b981' };
+    const defaultColorMap = { sight: '#3b82f6', hotel: '#ef4444', arrival: '#10b981' };
     const iconMap = { sight: '🏛️', hotel: '🏨', arrival: '📍' };
+
+    // 酒店根据档位用不同颜色
+    const markerColor = category === 'hotel' && poi.type && hotelColorMap[poi.type]
+      ? hotelColorMap[poi.type]
+      : defaultColorMap[category];
 
     const marker = new TMap.MultiMarker({
       map: map,
@@ -1234,7 +1249,7 @@
         'default': new TMap.MarkerStyle({
           width: 30, height: 40,
           anchor: { x: 15, y: 40 },
-          src: createMarkerIcon(colorMap[category], iconMap[category])
+          src: createMarkerIcon(markerColor, iconMap[category])
         })
       },
       geometries: [{
@@ -1246,11 +1261,16 @@
 
     marker.on('click', (e) => openModal(e.geometry.properties));
 
+    // 酒店标签显示名称 + 价格
+    const labelContent = category === 'hotel' && poi.price
+      ? `${poi.name} ¥${poi.price}`
+      : poi.name;
+
     const label = new TMap.MultiLabel({
       map: map,
       styles: {
         'default': new TMap.LabelStyle({
-          color: colorMap[category],
+          color: markerColor,
           size: 12,
           offset: { x: 0, y: -44 },
           backgroundColor: 'rgba(255,255,255,0.9)',
@@ -1261,7 +1281,7 @@
       geometries: [{
         id: `label_${category}_${poi.name}`,
         position: pos,
-        content: poi.name
+        content: labelContent
       }]
     });
 
@@ -1289,10 +1309,44 @@
   }
 
   function toggleMarkers(type, visible) {
-    const markers = type === 'sight' ? sightMarkers : hotelMarkers;
-    const labels = type === 'sight' ? sightLabels : hotelLabels;
+    if (type === 'hotel') {
+      // 酒店标记受预算档位过滤控制
+      if (visible) {
+        filterHotelMarkersByBudget();
+      } else {
+        hotelMarkers.forEach(m => m.setMap(null));
+        hotelLabels.forEach(l => l.setMap(null));
+      }
+      return;
+    }
+    const markers = sightMarkers;
+    const labels = sightLabels;
     markers.forEach(m => visible ? m.setMap(map) : m.setMap(null));
     labels.forEach(l => visible ? l.setMap(map) : l.setMap(null));
+  }
+
+  // 根据当前预算档位过滤显示酒店标记
+  // 舒适档 → 显示豪华/舒适酒店，标准档 → 显示标准/舒适酒店，经济档 → 显示经济酒店
+  function filterHotelMarkersByBudget() {
+    if (!layerHotels.checked) return; // 酒店图层关闭时不处理
+
+    const budgetToTypes = {
+      '舒适': ['豪华', '舒适'],
+      '标准': ['标准', '舒适'],
+      '经济': ['经济']
+    };
+    const allowedTypes = budgetToTypes[budget] || ['标准', '舒适'];
+
+    hotelMarkers.forEach((m, i) => {
+      // 从 marker 的 geometry properties 中获取酒店类型
+      const geom = m.getGeometries()[0];
+      const hotelType = geom && geom.properties ? geom.properties.type : '';
+      const match = allowedTypes.includes(hotelType);
+      m.setMap(match ? map : null);
+      if (hotelLabels[i]) {
+        hotelLabels[i].setMap(match ? map : null);
+      }
+    });
   }
 
   // ========== POI 弹窗 ==========
@@ -1389,18 +1443,40 @@
     const budgetCfg = BUDGET_CONFIG[budget];
     const arrival = cityInfo.arrivals[arrivalSelect.value || 0];
 
-    // 根据预算选酒店
+    // 根据预算选酒店：确保不同档位选到不同酒店
     let hotel;
-    if (budget === '舒适') {
-      hotel = hotels.filter(h => h.price >= 800).sort((a, b) => b.price - a.price)[0] || hotels[0];
-    } else if (budget === '标准') {
-      hotel = hotels.filter(h => h.price >= 300 && h.price <= 700).sort((a, b) => b.rating - a.rating)[0] || hotels[0];
-    } else {
-      hotel = hotels.filter(h => h.price <= 300).sort((a, b) => a.price - b.price)[0] || hotels[hotels.length - 1];
-    }
-    if (!hotel) hotel = hotels[0];
+    if (hotels.length > 0) {
+      // 按价格排序的副本，用于 fallback
+      const sortedByPrice = [...hotels].sort((a, b) => a.price - b.price);
+      const sortedByPriceDesc = [...hotels].sort((a, b) => b.price - a.price);
 
-    // ========== 智能路线规划：K-Means 聚类 + 最近邻 + 2-opt 优化 ==========
+      if (budget === '舒适') {
+        // 舒适档：优先选 ≥800 的最贵酒店，否则选整体最贵的
+        const luxury = hotels.filter(h => h.price >= 800).sort((a, b) => b.price - a.price);
+        hotel = luxury[0] || sortedByPriceDesc[0];
+      } else if (budget === '标准') {
+        // 标准档：优先选 300-700 区间评分最高的，否则选价格最接近中位数的
+        const mid = hotels.filter(h => h.price >= 300 && h.price <= 700).sort((a, b) => b.rating - a.rating);
+        if (mid.length > 0) {
+          hotel = mid[0];
+        } else {
+          // 没有 300-700 区间的，选价格最接近 500 的
+          const target = 500;
+          hotel = [...hotels].sort((a, b) => Math.abs(a.price - target) - Math.abs(b.price - target))[0];
+        }
+      } else {
+        // 经济档：优先选 ≤300 的最便宜酒店，否则选整体最便宜的
+        const cheap = hotels.filter(h => h.price <= 300).sort((a, b) => a.price - b.price);
+        hotel = cheap[0] || sortedByPrice[0];
+      }
+
+      // 最终保底：确保不同档位尽量选不同酒店
+      if (!hotel) hotel = hotels[0];
+    } else {
+      hotel = hotels[0];
+    }
+
+    // ========== 智能路线规划：Supercluster 聚类 + 最近邻 + 2-opt 优化 ==========
     // 1. 确定每天可游览的景点数
     const maxSpotsPerDay = (d) => d === 0 ? 3 : 4; // 第一天下午开始，少一些
     let totalSlots = 0;
@@ -1476,87 +1552,101 @@
     return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
   }
 
-  // ========== K-Means 地理聚类：将景点按实际坐标距离分成 K 组 ==========
-  // 参考 Google Maps marker clustering 和 Mapbox supercluster 的思路
-  // 使用标准 K-Means++ 初始化 + Lloyd 迭代
-  function kMeansCluster(points, k, maxIter) {
-    if (maxIter === undefined) maxIter = 50;
-    if (points.length <= k) {
-      // 景点数不超过天数，每天最多一个景点
+  // ========== Supercluster 地理聚类：基于 Mapbox 开源的层级贪心聚类算法 ==========
+  // Supercluster 使用基于 KD-Tree 的层级网格聚类，比 K-Means 更适合地理 POI：
+  // 1. 不假设簇形状（K-Means 假设球形簇）
+  // 2. 基于密度和距离的自然聚类
+  // 3. 确定性结果（不依赖随机初始化）
+  // 4. 通过 zoom level 精确控制簇的数量和粒度
+
+  // 使用 Supercluster 将景点聚成 targetK 个簇
+  // 通过遍历不同 radius 和 zoom level 来找到最接近 targetK 个簇的聚类结果
+  function superclusterGroup(points, targetK) {
+    if (points.length <= targetK) {
       return points.map(p => [p]);
     }
 
-    // K-Means++ 初始化：选择彼此尽量远的初始质心
-    const centroids = [];
-    // 第一个质心随机选
-    centroids.push({ lat: points[0].lat, lng: points[0].lng });
+    // 将景点转为 GeoJSON Feature 格式（Supercluster 要求）
+    const features = points.map((p, i) => ({
+      type: 'Feature',
+      properties: { _origIndex: i },
+      geometry: {
+        type: 'Point',
+        coordinates: [p.lng, p.lat] // GeoJSON 是 [lng, lat]
+      }
+    }));
 
-    for (let c = 1; c < k; c++) {
-      // 计算每个点到最近质心的距离
-      const dists = points.map(p => {
-        let minD = Infinity;
-        centroids.forEach(cen => {
-          const d = geoDistance(p.lat, p.lng, cen.lat, cen.lng);
-          if (d < minD) minD = d;
-        });
-        return minD * minD; // 距离平方作为权重
+    // 计算景点的地理范围（用于 getClusters 的 bbox）
+    let minLng = Infinity, maxLng = -Infinity, minLat = Infinity, maxLat = -Infinity;
+    points.forEach(p => {
+      if (p.lng < minLng) minLng = p.lng;
+      if (p.lng > maxLng) maxLng = p.lng;
+      if (p.lat < minLat) minLat = p.lat;
+      if (p.lat > maxLat) maxLat = p.lat;
+    });
+    const pad = 0.01;
+    const bbox = [minLng - pad, minLat - pad, maxLng + pad, maxLat + pad];
+
+    // 遍历不同 radius × zoom 组合，找到簇数最接近 targetK 的最佳参数
+    const radiusCandidates = [40, 60, 80, 100, 120, 150, 200, 250];
+    let bestIndex = null;
+    let bestClusters = null;
+    let bestDiff = Infinity;
+
+    for (const r of radiusCandidates) {
+      const idx = new Supercluster({
+        radius: r,
+        maxZoom: 20,
+        minZoom: 0,
+        minPoints: 1
       });
-      const totalDist = dists.reduce((s, d) => s + d, 0);
-      // 按距离加权随机选择下一个质心
-      let r = Math.random() * totalDist;
-      let chosen = 0;
-      for (let i = 0; i < dists.length; i++) {
-        r -= dists[i];
-        if (r <= 0) { chosen = i; break; }
+      idx.load(features);
+
+      for (let z = 0; z <= 20; z++) {
+        const cls = idx.getClusters(bbox, z);
+        const diff = Math.abs(cls.length - targetK);
+        if (diff < bestDiff || (diff === bestDiff && cls.length >= targetK)) {
+          bestDiff = diff;
+          bestIndex = idx;
+          bestClusters = cls;
+        }
+        if (diff === 0) break;
       }
-      centroids.push({ lat: points[chosen].lat, lng: points[chosen].lng });
+      if (bestDiff === 0) break;
     }
 
-    // Lloyd 迭代
-    let assignments = new Array(points.length).fill(0);
-    for (let iter = 0; iter < maxIter; iter++) {
-      let changed = false;
+    // 降级：如果完全没有结果
+    if (!bestClusters || bestClusters.length === 0) {
+      return points.map(p => [p]);
+    }
 
-      // E 步：将每个点分配到最近的质心
-      for (let i = 0; i < points.length; i++) {
-        let bestC = 0;
-        let bestD = Infinity;
-        for (let c = 0; c < k; c++) {
-          const d = geoDistance(points[i].lat, points[i].lng, centroids[c].lat, centroids[c].lng);
-          if (d < bestD) { bestD = d; bestC = c; }
-        }
-        if (assignments[i] !== bestC) {
-          assignments[i] = bestC;
-          changed = true;
-        }
-      }
-
-      if (!changed) break; // 已收敛
-
-      // M 步：更新质心为簇内均值
-      for (let c = 0; c < k; c++) {
-        let sumLat = 0, sumLng = 0, count = 0;
-        for (let i = 0; i < points.length; i++) {
-          if (assignments[i] === c) {
-            sumLat += points[i].lat;
-            sumLng += points[i].lng;
-            count++;
+    // 将 Supercluster 的聚类结果转回原始景点数组
+    const result = [];
+    bestClusters.forEach(cluster => {
+      const group = [];
+      if (cluster.properties.cluster) {
+        // 这是一个聚类簇，获取其中的所有叶子节点
+        const clusterId = cluster.properties.cluster_id;
+        const leaves = bestIndex.getLeaves(clusterId, Infinity);
+        leaves.forEach(leaf => {
+          const origIdx = leaf.properties._origIndex;
+          if (origIdx !== undefined && points[origIdx]) {
+            group.push(points[origIdx]);
           }
-        }
-        if (count > 0) {
-          centroids[c].lat = sumLat / count;
-          centroids[c].lng = sumLng / count;
+        });
+      } else {
+        // 这是一个单独的点
+        const origIdx = cluster.properties._origIndex;
+        if (origIdx !== undefined && points[origIdx]) {
+          group.push(points[origIdx]);
         }
       }
-    }
+      if (group.length > 0) {
+        result.push(group);
+      }
+    });
 
-    // 按分配结果分组
-    const clusters = Array.from({ length: k }, () => []);
-    for (let i = 0; i < points.length; i++) {
-      clusters[assignments[i]].push(points[i]);
-    }
-
-    return clusters;
+    return result;
   }
 
   // ========== 最近邻算法 + 2-opt 局部优化 ==========
@@ -1634,7 +1724,7 @@
   }
 
   // ========== 地理聚类：将景点按实际地理位置分配到每天 ==========
-  // 使用 K-Means 聚类 + 簇间排序 + 容量均衡
+  // 使用 Supercluster 层级聚类 + 簇间最近邻排序 + 容量均衡
   function clusterSightsByDay(sights, numDays, hotel, arrival) {
     if (sights.length === 0) return Array.from({ length: numDays }, () => []);
     if (numDays === 1) return [sights];
@@ -1642,31 +1732,40 @@
     // 每天的最大景点数
     const maxPerDay = (d) => d === 0 ? 3 : 4;
 
-    // 第一步：K-Means 聚类
-    let clusters = kMeansCluster(sights, numDays);
+    // 第一步：Supercluster 聚类
+    let clusters = superclusterGroup(sights, numDays);
 
-    // 移除空簇并重新聚类（K-Means 可能产生空簇）
-    clusters = clusters.filter(c => c.length > 0);
+    // 处理簇数与天数不匹配的情况
+    // 如果簇太少，拆分最大的簇
     while (clusters.length < numDays && clusters.some(c => c.length > 1)) {
-      // 找到最大的簇，拆分它
       let maxIdx = 0;
       for (let i = 1; i < clusters.length; i++) {
         if (clusters[i].length > clusters[maxIdx].length) maxIdx = i;
       }
       const big = clusters.splice(maxIdx, 1)[0];
-      const sub = kMeansCluster(big, 2);
+      // 对大簇再次用 Supercluster 拆分成 2 组
+      const sub = superclusterGroup(big, 2);
       clusters.push(...sub.filter(c => c.length > 0));
     }
 
-    // 第二步：按簇质心到酒店/到达点的距离排序
-    // 第一天从到达点出发，所以离到达点最近的簇排第一天
-    const clusterCentroids = clusters.map(c => {
-      const avgLat = c.reduce((s, p) => s + p.lat, 0) / c.length;
-      const avgLng = c.reduce((s, p) => s + p.lng, 0) / c.length;
-      return { lat: avgLat, lng: avgLng };
-    });
+    // 如果簇太多，合并最近的两个簇
+    while (clusters.length > numDays) {
+      let bestI = 0, bestJ = 1, bestDist = Infinity;
+      for (let i = 0; i < clusters.length; i++) {
+        for (let j = i + 1; j < clusters.length; j++) {
+          const ci = clusterCentroid(clusters[i]);
+          const cj = clusterCentroid(clusters[j]);
+          const d = geoDistance(ci.lat, ci.lng, cj.lat, cj.lng);
+          if (d < bestDist) { bestDist = d; bestI = i; bestJ = j; }
+        }
+      }
+      // 合并 j 到 i
+      clusters[bestI] = clusters[bestI].concat(clusters[bestJ]);
+      clusters.splice(bestJ, 1);
+    }
 
-    // 用最近邻法对簇排序：第一天从到达点出发
+    // 第二步：按簇质心到到达点的距离排序（最近邻法）
+    // 第一天从到达点出发，所以离到达点最近的簇排第一天
     const clusterOrder = [];
     const remainingClusters = clusters.map((c, i) => i);
     let curPoint = { lat: arrival.lat, lng: arrival.lng };
@@ -1676,29 +1775,27 @@
       let bestDist = Infinity;
       for (let i = 0; i < remainingClusters.length; i++) {
         const ci = remainingClusters[i];
-        const d = geoDistance(curPoint.lat, curPoint.lng, clusterCentroids[ci].lat, clusterCentroids[ci].lng);
+        const cent = clusterCentroid(clusters[ci]);
+        const d = geoDistance(curPoint.lat, curPoint.lng, cent.lat, cent.lng);
         if (d < bestDist) { bestDist = d; bestIdx = i; }
       }
       const chosen = remainingClusters.splice(bestIdx, 1)[0];
       clusterOrder.push(chosen);
-      curPoint = clusterCentroids[chosen];
+      curPoint = clusterCentroid(clusters[chosen]);
     }
 
-    // 第三步：将排序后的簇分配到每天，并做容量均衡
+    // 第三步：将排序后的簇分配到每天
     const dailySights = Array.from({ length: numDays }, () => []);
 
-    // 如果簇数等于天数，直接一一对应
     if (clusterOrder.length === numDays) {
       clusterOrder.forEach((ci, d) => {
-        dailySights[d] = clusters[ci];
+        dailySights[d] = [...clusters[ci]];
       });
     } else if (clusterOrder.length < numDays) {
-      // 簇数少于天数，先分配，剩余天留空
       clusterOrder.forEach((ci, d) => {
-        dailySights[d] = clusters[ci];
+        dailySights[d] = [...clusters[ci]];
       });
     } else {
-      // 簇数多于天数（不太可能但防御性处理），合并相邻簇
       const perDay = Math.ceil(clusterOrder.length / numDays);
       for (let d = 0; d < numDays; d++) {
         const start = d * perDay;
@@ -1709,7 +1806,7 @@
       }
     }
 
-    // 第四步：容量均衡 — 如果某天景点过多，将最远的景点移到最近的有空位的天
+    // 第四步：容量均衡 — 如果某天景点过多，将最远的景点移到地理上最近的有空位的天
     let balanced = false;
     let balanceRounds = 20;
     while (!balanced && balanceRounds-- > 0) {
@@ -1718,11 +1815,7 @@
         const max = maxPerDay(d);
         while (dailySights[d].length > max) {
           balanced = false;
-          // 找到该天中离质心最远的景点
-          const centroid = {
-            lat: dailySights[d].reduce((s, p) => s + p.lat, 0) / dailySights[d].length,
-            lng: dailySights[d].reduce((s, p) => s + p.lng, 0) / dailySights[d].length
-          };
+          const centroid = clusterCentroid(dailySights[d]);
           let farthestIdx = 0;
           let farthestDist = 0;
           dailySights[d].forEach((s, i) => {
@@ -1731,16 +1824,14 @@
           });
           const overflow = dailySights[d].splice(farthestIdx, 1)[0];
 
-          // 找到有空位且质心最近的天
           let bestDay = -1;
           let bestDayDist = Infinity;
           for (let dd = 0; dd < numDays; dd++) {
             if (dd === d) continue;
             if (dailySights[dd].length < maxPerDay(dd)) {
-              const ddCentroid = dailySights[dd].length > 0 ? {
-                lat: dailySights[dd].reduce((s, p) => s + p.lat, 0) / dailySights[dd].length,
-                lng: dailySights[dd].reduce((s, p) => s + p.lng, 0) / dailySights[dd].length
-              } : { lat: hotel.lat, lng: hotel.lng };
+              const ddCentroid = dailySights[dd].length > 0
+                ? clusterCentroid(dailySights[dd])
+                : { lat: hotel.lat, lng: hotel.lng };
               const dist = geoDistance(overflow.lat, overflow.lng, ddCentroid.lat, ddCentroid.lng);
               if (dist < bestDayDist) { bestDayDist = dist; bestDay = dd; }
             }
@@ -1748,7 +1839,6 @@
           if (bestDay >= 0) {
             dailySights[bestDay].push(overflow);
           } else {
-            // 所有天都满了，放回最少的那天
             const minDay = dailySights.reduce((mi, arr, idx) =>
               arr.length < dailySights[mi].length ? idx : mi, 0);
             dailySights[minDay].push(overflow);
@@ -1759,6 +1849,14 @@
     }
 
     return dailySights;
+  }
+
+  // 辅助函数：计算一组点的质心
+  function clusterCentroid(points) {
+    if (points.length === 0) return { lat: 0, lng: 0 };
+    const avgLat = points.reduce((s, p) => s + p.lat, 0) / points.length;
+    const avgLng = points.reduce((s, p) => s + p.lng, 0) / points.length;
+    return { lat: avgLat, lng: avgLng };
   }
 
   // ========== 渲染行程 ==========
