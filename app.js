@@ -140,6 +140,7 @@
   const $ = (s) => document.querySelector(s);
   const $$ = (s) => document.querySelectorAll(s);
 
+  const citySelect = $('#citySelect');
   const cityInput = $('#cityInput');
   const citySuggestions = $('#citySuggestions');
   const daysValue = $('#daysValue');
@@ -162,6 +163,7 @@
 
   // ========== 初始化 ==========
   function init() {
+    populateCities();
     initCitySearch();
     initMap();
     bindEvents();
@@ -170,9 +172,20 @@
     setTimeout(() => loadCity(currentCity), 1000);
   }
 
+  // 填充城市下拉菜单（全部预设城市）
+  function populateCities() {
+    ALL_CITIES.forEach(c => {
+      const opt = document.createElement('option');
+      opt.value = c;
+      opt.textContent = c;
+      citySelect.appendChild(opt);
+    });
+    citySelect.value = currentCity;
+  }
+
   // 初始化城市搜索输入框
   function initCitySearch() {
-    cityInput.value = currentCity;
+    cityInput.value = '';
   }
 
   function initMap() {
@@ -371,21 +384,153 @@
 
   // ========== 城市数据线上获取 ==========
 
-  // 通过地理编码 API 获取城市中心坐标
+  // 通过地理编码 API 获取地点中心坐标
+  // 智能处理：依次尝试多种候选地址，只要能定位到坐标就返回
   async function geocodeCity(cityName) {
-    const url = 'https://apis.map.qq.com/ws/geocoder/v1/?address=' +
-      encodeURIComponent(cityName) +
-      '&key=' + API_KEY;
+    // 构建候选地址列表：优先带"市"后缀，再尝试原名
+    const candidates = [];
+    if (!cityName.endsWith('市') && !cityName.endsWith('省') && !cityName.endsWith('区') && !cityName.endsWith('县') && !cityName.endsWith('州')) {
+      candidates.push(cityName + '市');
+    }
+    candidates.push(cityName);
 
-    const result = await jsonp(url);
-    if (!result || result.status !== 0 || !result.result || !result.result.location) {
-      throw new Error('无法获取城市坐标: ' + (result && result.message || '未知错误'));
+    let lastError = '';
+    for (const addr of candidates) {
+      try {
+        const url = 'https://apis.map.qq.com/ws/geocoder/v1/?address=' +
+          encodeURIComponent(addr) +
+          '&key=' + API_KEY;
+
+        const result = await jsonp(url);
+        if (result && result.status === 0 && result.result && result.result.location) {
+          return {
+            lat: result.result.location.lat,
+            lng: result.result.location.lng
+          };
+        }
+        lastError = (result && result.message) || '未知错误';
+      } catch (e) {
+        lastError = e.message;
+      }
     }
 
-    return {
-      lat: result.result.location.lat,
-      lng: result.result.location.lng
-    };
+    throw new Error('无法定位"' + cityName + '"的坐标: ' + lastError);
+  }
+
+  // 通过坐标逆地理编码获取所在城市名
+  async function reverseGeocode(lat, lng) {
+    await throttleRequest();
+    const url = 'https://apis.map.qq.com/ws/geocoder/v1/?location=' +
+      lat + ',' + lng + '&key=' + API_KEY;
+
+    try {
+      const result = await jsonp(url);
+      if (result && result.status === 0 && result.result && result.result.address_component) {
+        const comp = result.result.address_component;
+        // 返回城市名（去掉"市"后缀以匹配预设数据）
+        const city = (comp.city || '').replace(/市$/, '');
+        const district = comp.district || '';
+        const province = (comp.province || '').replace(/省$/, '');
+        return {
+          city: city,
+          district: district,
+          province: province,
+          fullAddress: result.result.address || ''
+        };
+      }
+    } catch (e) {
+      console.warn('逆地理编码失败:', e.message);
+    }
+    return null;
+  }
+
+  // 通过 POI 搜索定位任意地点，返回 { lat, lng, name, city, address }
+  async function searchPOILocation(keyword) {
+    await throttleRequest();
+    // 全国范围搜索该 POI
+    const url = 'https://apis.map.qq.com/ws/place/v1/search/?keyword=' +
+      encodeURIComponent(keyword) +
+      '&boundary=region(全国,0)' +
+      '&page_size=5&page_index=1&key=' + API_KEY;
+
+    try {
+      const result = await jsonp(url);
+      if (result && result.status === 0 && result.data && result.data.length > 0) {
+        const poi = result.data[0];
+        return {
+          lat: poi.location.lat,
+          lng: poi.location.lng,
+          name: poi.title,
+          address: poi.address || '',
+          city: poi.ad_info ? (poi.ad_info.city || '').replace(/市$/, '') : ''
+        };
+      }
+    } catch (e) {
+      console.warn('POI 搜索定位失败:', e.message);
+    }
+    return null;
+  }
+
+  // 智能解析用户输入：可能是城市名、也可能是任意 POI
+  // 返回 { cityName, poiInfo? } — cityName 是最终要规划的城市
+  async function resolveUserInput(input) {
+    input = input.trim();
+    if (!input) return null;
+
+    // 1. 先检查是否直接匹配预设城市
+    if (CITY_DATA[input] || ALL_CITIES.includes(input)) {
+      return { cityName: input };
+    }
+
+    // 2. 检查是否匹配缓存城市
+    const cachedNames = CityCache.getCachedCityNames();
+    if (cachedNames.includes(input)) {
+      return { cityName: input };
+    }
+
+    // 3. 尝试 POI 搜索 — 用户可能输入了具体地点
+    const loadingEl = showSearchStatus('正在搜索 "' + input + '"...');
+    try {
+      const poiResult = await searchPOILocation(input);
+
+      if (poiResult && poiResult.lat && poiResult.lng) {
+        // POI 搜索成功，获取到坐标
+        let cityName = poiResult.city;
+
+        // 如果 POI 搜索结果没有城市信息，通过逆地理编码获取
+        if (!cityName) {
+          const geoInfo = await reverseGeocode(poiResult.lat, poiResult.lng);
+          if (geoInfo && geoInfo.city) {
+            cityName = geoInfo.city;
+          }
+        }
+
+        if (cityName) {
+          return {
+            cityName: cityName,
+            poiInfo: poiResult
+          };
+        }
+      }
+
+      // 4. POI 搜索无结果，尝试当作城市名进行地理编码
+      try {
+        await throttleRequest();
+        const location = await geocodeCity(input);
+        // 地理编码成功，通过逆地理编码确认城市名
+        const geoInfo = await reverseGeocode(location.lat, location.lng);
+        if (geoInfo && geoInfo.city) {
+          return { cityName: geoInfo.city };
+        }
+        // 逆地理编码失败，直接用输入作为城市名
+        return { cityName: input };
+      } catch (e) {
+        // 完全无法识别
+        return null;
+      }
+    } finally {
+      if (loadingEl) loadingEl.remove();
+    }
   }
 
   // 搜索城市交通枢纽（机场、高铁站、火车站）
@@ -499,11 +644,24 @@
     try {
       return await fetchCityDataOnline(cityName);
     } catch (e) {
-      // 降级：如果预设数据存在则使用
-      if (CITY_DATA[cityName]) {
-        return CITY_DATA[cityName];
+      // 最终降级：只要能获取到坐标就构造最小可用数据
+      try {
+        await throttleRequest();
+        const location = await geocodeCity(cityName);
+        const fallbackData = {
+          center: [location.lng, location.lat],
+          arrivals: [{
+            name: cityName + '中心',
+            lat: location.lat,
+            lng: location.lng,
+            type: '城市中心'
+          }]
+        };
+        CityCache.set(cityName, fallbackData);
+        return fallbackData;
+      } catch (e2) {
+        throw new Error('无法定位"' + cityName + '"，请尝试输入更具体的地名（如城市名）');
       }
-      throw new Error('获取城市数据失败: ' + e.message + '\n建议选择预设的热门城市');
     }
   }
 
@@ -545,7 +703,7 @@
 
   // ========== 城市搜索建议 ==========
 
-  // 通过行政区划 API 搜索城市
+  // 通过行政区划 API 搜索城市（同时支持 POI 搜索提示）
   async function searchCitySuggestions(keyword) {
     if (!keyword || keyword.length === 0) return [];
 
@@ -559,7 +717,8 @@
         localResults.push({
           name: name,
           isPreset: ALL_CITIES.includes(name),
-          isCached: cachedNames.includes(name)
+          isCached: cachedNames.includes(name),
+          isPOI: false
         });
       }
     });
@@ -571,8 +730,18 @@
       return 0;
     });
 
-    // 如果本地结果足够多，不发起 API 请求
+    // 如果本地结果足够多，不发起 API 请求（但仍添加"搜索此地点"选项）
     if (localResults.length >= 5 || apiSuspended) {
+      // 如果输入不完全匹配已知城市，添加一个"搜索此地点"选项
+      if (!allKnownCities.includes(keyword)) {
+        localResults.push({
+          name: keyword,
+          isPreset: false,
+          isCached: false,
+          isPOI: true,
+          displayName: '🔍 搜索 "' + keyword + '" 并规划所在城市'
+        });
+      }
       return localResults.slice(0, 10);
     }
 
@@ -589,15 +758,14 @@
       if (result && result.status === 0 && result.result && result.result[0]) {
         const districts = result.result[0];
         districts.forEach(d => {
-          // 仅保留城市级别（地级市及以上），过滤区/县/街道
-          // cidx 数组存在表示有子级行政区，fullname 包含"市"表示是城市
           const cityName = d.fullname.replace(/市$/, '');
           if (!localResults.some(r => r.name === cityName) && !localResults.some(r => r.name === d.fullname)) {
             const name = ALL_CITIES.includes(cityName) ? cityName : (ALL_CITIES.includes(d.fullname) ? d.fullname : cityName);
             localResults.push({
               name: name,
               isPreset: ALL_CITIES.includes(name),
-              isCached: false
+              isCached: false,
+              isPOI: false
             });
           }
         });
@@ -605,6 +773,18 @@
     } catch (e) {
       console.warn('城市搜索建议 API 失败:', e.message);
       recordApiFailure();
+    }
+
+    // 始终在末尾添加"搜索此地点"选项（如果输入不完全匹配已知城市）
+    const allNames = localResults.map(r => r.name);
+    if (!allNames.includes(keyword)) {
+      localResults.push({
+        name: keyword,
+        isPreset: false,
+        isCached: false,
+        isPOI: true,
+        displayName: '🔍 搜索 "' + keyword + '" 并规划所在城市'
+      });
     }
 
     return localResults.slice(0, 10);
@@ -615,6 +795,17 @@
   let suggestionsVisible = false;
 
   function bindEvents() {
+    // 城市下拉菜单事件
+    citySelect.addEventListener('change', () => {
+      const name = citySelect.value;
+      if (name && name !== currentCity) {
+        currentCity = name;
+        cityInput.value = '';
+        closeItinerary();
+        loadCity(currentCity);
+      }
+    });
+
     // 城市搜索输入框事件
     bindCitySearchEvents();
 
@@ -699,7 +890,7 @@
     // 聚焦时显示建议
     cityInput.addEventListener('focus', () => {
       const keyword = cityInput.value.trim();
-      if (!keyword || keyword === currentCity) {
+      if (!keyword) {
         showHotCities();
       } else {
         // 触发一次搜索
@@ -707,15 +898,15 @@
       }
     });
 
-    // 失焦时恢复上次选择
+    // 失焦时清空搜索框
     cityInput.addEventListener('blur', (e) => {
       // 延迟关闭，以便点击建议项时能先触发
       setTimeout(() => {
         if (suggestionsVisible) {
           hideSuggestions();
         }
-        // 恢复上次选择的城市名
-        cityInput.value = currentCity;
+        // 清空搜索框
+        cityInput.value = '';
       }, 200);
     });
 
@@ -740,12 +931,22 @@
         items.forEach(item => item.classList.remove('active'));
         items[prevIdx].classList.add('active');
         items[prevIdx].scrollIntoView({ block: 'nearest' });
-      } else if (e.key === 'Enter') {
+    } else if (e.key === 'Enter') {
         e.preventDefault();
         if (activeItem) {
-          selectCity(activeItem.dataset.city);
-        } else if (items.length > 0) {
-          selectCity(items[0].dataset.city);
+          if (activeItem.dataset.isPoi === 'true') {
+            handlePOIInput(activeItem.dataset.city);
+          } else {
+            selectCity(activeItem.dataset.city);
+          }
+        } else {
+          // 没有选中项时，直接将输入作为 POI 搜索
+          const inputVal = cityInput.value.trim();
+          if (inputVal) {
+            handlePOIInput(inputVal);
+          } else if (items.length > 0) {
+            selectCity(items[0].dataset.city);
+          }
         }
       }
     });
@@ -766,7 +967,7 @@
     citySuggestions.innerHTML = '';
 
     if (suggestions.length === 0) {
-      citySuggestions.innerHTML = '<div class="city-suggestion-empty">😕 未找到匹配城市</div>';
+      citySuggestions.innerHTML = '<div class="city-suggestion-empty">😕 未找到匹配城市，按回车可搜索任意地点</div>';
       citySuggestions.classList.add('visible');
       suggestionsVisible = true;
       return;
@@ -783,30 +984,43 @@
       const item = document.createElement('div');
       item.className = 'city-suggestion-item';
       item.dataset.city = s.name;
+      if (s.isPOI) item.dataset.isPoi = 'true';
 
-      // 高亮匹配文字
-      let nameHtml = s.name;
-      if (keyword) {
-        const idx = s.name.indexOf(keyword);
-        if (idx >= 0) {
-          nameHtml = s.name.substring(0, idx) +
-            '<strong style="color:var(--c-primary)">' + keyword + '</strong>' +
-            s.name.substring(idx + keyword.length);
+      if (s.isPOI) {
+        // POI 搜索选项，特殊样式
+        item.innerHTML = '<span style="color:var(--c-primary);font-weight:600">' + (s.displayName || s.name) + '</span>';
+        item.style.borderTop = '1px solid #e2e8f0';
+        item.style.marginTop = '4px';
+        item.style.paddingTop = '10px';
+      } else {
+        // 高亮匹配文字
+        let nameHtml = s.name;
+        if (keyword) {
+          const idx = s.name.indexOf(keyword);
+          if (idx >= 0) {
+            nameHtml = s.name.substring(0, idx) +
+              '<strong style="color:var(--c-primary)">' + keyword + '</strong>' +
+              s.name.substring(idx + keyword.length);
+          }
         }
-      }
 
-      let tagHtml = '';
-      if (s.isPreset) {
-        tagHtml = '<span class="city-tag preset">推荐</span>';
-      } else if (s.isCached) {
-        tagHtml = '<span class="city-tag cached">已缓存</span>';
-      }
+        let tagHtml = '';
+        if (s.isPreset) {
+          tagHtml = '<span class="city-tag preset">推荐</span>';
+        } else if (s.isCached) {
+          tagHtml = '<span class="city-tag cached">已缓存</span>';
+        }
 
-      item.innerHTML = '<span>' + nameHtml + '</span>' + tagHtml;
+        item.innerHTML = '<span>' + nameHtml + '</span>' + tagHtml;
+      }
 
       item.addEventListener('mousedown', (e) => {
         e.preventDefault(); // 阻止 blur 事件
-        selectCity(s.name);
+        if (s.isPOI) {
+          handlePOIInput(s.name);
+        } else {
+          selectCity(s.name);
+        }
       });
 
       citySuggestions.appendChild(item);
@@ -825,13 +1039,97 @@
   // 选择城市
   function selectCity(cityName) {
     hideSuggestions();
-    cityInput.value = cityName;
+    cityInput.value = '';
     if (cityName !== currentCity) {
       currentCity = cityName;
+      // 同步更新下拉菜单（如果该城市在预设列表中）
+      if (ALL_CITIES.includes(cityName)) {
+        citySelect.value = cityName;
+      } else {
+        // 非预设城市，添加到下拉菜单并选中
+        let found = false;
+        for (const opt of citySelect.options) {
+          if (opt.value === cityName) { found = true; break; }
+        }
+        if (!found) {
+          const opt = document.createElement('option');
+          opt.value = cityName;
+          opt.textContent = cityName + ' ✨';
+          citySelect.appendChild(opt);
+        }
+        citySelect.value = cityName;
+      }
       closeItinerary();
       loadCity(currentCity);
     }
     cityInput.blur();
+  }
+
+  // 处理任意 POI 输入：搜索 POI → 逆地理编码 → 定位城市 → 规划
+  async function handlePOIInput(input) {
+    hideSuggestions();
+    cityInput.value = '';
+    cityInput.blur();
+
+    const loadingEl = showSearchStatus('正在智能识别 "' + input + '" 所在城市...');
+
+    try {
+      const resolved = await resolveUserInput(input);
+
+      if (!resolved) {
+        showSearchStatus('⚠️ 无法识别 "' + input + '"，请尝试输入更具体的地名');
+        setTimeout(() => {
+          const tip = document.querySelector('.search-status');
+          if (tip) tip.remove();
+        }, 4000);
+        return;
+      }
+
+      const cityName = resolved.cityName;
+
+      // 显示识别结果
+      if (resolved.poiInfo) {
+        showSearchStatus('✅ 已定位到 "' + resolved.poiInfo.name + '"，所在城市：' + cityName);
+      } else {
+        showSearchStatus('✅ 已识别城市：' + cityName);
+      }
+      setTimeout(() => {
+        const tip = document.querySelector('.search-status');
+        if (tip) tip.remove();
+      }, 3000);
+
+      // 切换到识别出的城市
+      if (cityName !== currentCity) {
+        currentCity = cityName;
+        // 更新下拉菜单
+        if (ALL_CITIES.includes(cityName)) {
+          citySelect.value = cityName;
+        } else {
+          let found = false;
+          for (const opt of citySelect.options) {
+            if (opt.value === cityName) { found = true; break; }
+          }
+          if (!found) {
+            const opt = document.createElement('option');
+            opt.value = cityName;
+            opt.textContent = cityName + ' ✨';
+            citySelect.appendChild(opt);
+          }
+          citySelect.value = cityName;
+        }
+        closeItinerary();
+        await loadCity(currentCity);
+      }
+    } catch (e) {
+      console.error('POI 输入处理失败:', e);
+      showSearchStatus('⚠️ 处理失败: ' + e.message);
+      setTimeout(() => {
+        const tip = document.querySelector('.search-status');
+        if (tip) tip.remove();
+      }, 4000);
+    } finally {
+      if (loadingEl) loadingEl.remove();
+    }
   }
 
   // ========== 预算详情 ==========
@@ -1102,14 +1400,29 @@
     }
     if (!hotel) hotel = hotels[0];
 
-    shuffleArray(sights);
+    // ========== 智能路线规划：按地理位置分配 + 最近邻排序 ==========
+    // 1. 确定每天可游览的景点数
+    const maxSpotsPerDay = (d) => d === 0 ? 3 : 4; // 第一天下午开始，少一些
+    let totalSlots = 0;
+    for (let d = 0; d < days; d++) totalSlots += maxSpotsPerDay(d);
+    const usableSights = sights.slice(0, Math.min(sights.length, totalSlots));
 
+    // 2. 用 K-Means 风格的地理聚类将景点分配到每天
+    const dailySights = clusterSightsByDay(usableSights, days, hotel, arrival);
+
+    // 3. 每天内部用最近邻算法排序，起点为酒店（第一天为到达点）
+    for (let d = 0; d < dailySights.length; d++) {
+      const startPoint = d === 0 ? arrival : hotel;
+      dailySights[d] = sortByNearestNeighbor(dailySights[d], startPoint);
+    }
+
+    // 4. 生成行程
     const schedule = [];
-    let sightIdx = 0;
-    const spotsPerDay = Math.max(2, Math.ceil(sights.length / days));
+    let totalTicket = 0;
 
     for (let d = 0; d < days; d++) {
       const dayPlan = { day: d + 1, items: [] };
+      const daySights = dailySights[d] || [];
 
       if (d === 0) {
         dayPlan.items.push({ time: '09:00', name: arrival.name, desc: `抵达${currentCity}，${arrival.type}`, tag: '到达', lat: arrival.lat, lng: arrival.lng });
@@ -1117,19 +1430,18 @@
       }
 
       const startHour = d === 0 ? 13 : 9;
-      const daySpots = Math.min(spotsPerDay, sights.length - sightIdx);
 
-      for (let s = 0; s < daySpots && sightIdx < sights.length; s++) {
-        const sight = sights[sightIdx++];
+      daySights.forEach((sight, s) => {
         const hour = startHour + s * 2;
-        if (hour >= 20) break;
+        if (hour >= 20) return;
+        totalTicket += (sight.price || 0);
         dayPlan.items.push({
           time: `${String(hour).padStart(2, '0')}:00`,
           name: sight.name,
           desc: `${sight.type} · ${sight.duration || '2小时'} · ${sight.price === 0 ? '免费' : '¥' + sight.price}`,
           tag: sight.type, lat: sight.lat, lng: sight.lng
         });
-      }
+      });
 
       dayPlan.items.push({ time: '19:00', name: `${currentCity}特色美食`, desc: `餐饮预算 ≈ ¥${budgetCfg.food}`, tag: '餐饮' });
 
@@ -1148,16 +1460,100 @@
         hotel: hotel.price * Math.max(days - 1, 1),
         food: budgetCfg.food * days,
         transport: budgetCfg.transport * days,
-        ticket: sights.slice(0, sightIdx).reduce((sum, s) => sum + (s.price || 0), 0)
+        ticket: totalTicket
       }
     };
   }
 
-  function shuffleArray(arr) {
-    for (let i = arr.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [arr[i], arr[j]] = [arr[j], arr[i]];
+  // ========== 地理距离计算（Haversine 公式） ==========
+  function geoDistance(lat1, lng1, lat2, lng2) {
+    const R = 6371; // 地球半径 km
+    const dLat = (lat2 - lat1) * Math.PI / 180;
+    const dLng = (lng2 - lng1) * Math.PI / 180;
+    const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+      Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+      Math.sin(dLng / 2) * Math.sin(dLng / 2);
+    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  }
+
+  // ========== 最近邻算法：从起点出发，每次选最近的未访问景点 ==========
+  function sortByNearestNeighbor(sights, startPoint) {
+    if (sights.length <= 1) return sights;
+
+    const sorted = [];
+    const remaining = [...sights];
+    let curLat = startPoint.lat;
+    let curLng = startPoint.lng;
+
+    while (remaining.length > 0) {
+      let nearestIdx = 0;
+      let nearestDist = Infinity;
+
+      for (let i = 0; i < remaining.length; i++) {
+        const d = geoDistance(curLat, curLng, remaining[i].lat, remaining[i].lng);
+        if (d < nearestDist) {
+          nearestDist = d;
+          nearestIdx = i;
+        }
+      }
+
+      const nearest = remaining.splice(nearestIdx, 1)[0];
+      sorted.push(nearest);
+      curLat = nearest.lat;
+      curLng = nearest.lng;
     }
+
+    return sorted;
+  }
+
+  // ========== 地理聚类：将景点按地理位置分配到每天 ==========
+  function clusterSightsByDay(sights, numDays, hotel, arrival) {
+    if (sights.length === 0) return Array.from({ length: numDays }, () => []);
+    if (numDays === 1) return [sights];
+
+    // 每天的最大景点数
+    const maxPerDay = (d) => d === 0 ? 3 : 4;
+
+    // 使用角度分区法：以酒店为中心，按角度将景点分成 numDays 个扇区
+    const centerLat = hotel.lat;
+    const centerLng = hotel.lng;
+
+    // 计算每个景点相对于酒店的角度
+    const sightsWithAngle = sights.map(s => ({
+      ...s,
+      angle: Math.atan2(s.lat - centerLat, s.lng - centerLng)
+    }));
+
+    // 按角度排序
+    sightsWithAngle.sort((a, b) => a.angle - b.angle);
+
+    // 均匀分配到每天
+    const dailySights = Array.from({ length: numDays }, () => []);
+    let dayIdx = 0;
+
+    sightsWithAngle.forEach(s => {
+      // 找到还有空位的最近一天
+      let assigned = false;
+      for (let attempt = 0; attempt < numDays; attempt++) {
+        const idx = (dayIdx + attempt) % numDays;
+        if (dailySights[idx].length < maxPerDay(idx)) {
+          dailySights[idx].push(s);
+          assigned = true;
+          if (dailySights[idx].length >= maxPerDay(idx)) {
+            dayIdx = (idx + 1) % numDays;
+          }
+          break;
+        }
+      }
+      // 如果所有天都满了，加到最少的那天
+      if (!assigned) {
+        const minDay = dailySights.reduce((minIdx, arr, idx) =>
+          arr.length < dailySights[minIdx].length ? idx : minIdx, 0);
+        dailySights[minDay].push(s);
+      }
+    });
+
+    return dailySights;
   }
 
   // ========== 渲染行程 ==========
