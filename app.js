@@ -94,7 +94,7 @@
       const m = script.src.match(/key=([^&]+)/);
       if (m) return m[1];
     }
-    return 'OB4BZ-D4W3U-B7VVO-4PJWW-6TKDJ-WPB77';
+    return 'GGHBZ-ELU6A-A5YKL-C3ITZ-4UEBF-PKBDJ';
   })();
 
   // JSONP 请求
