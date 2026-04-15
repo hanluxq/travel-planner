@@ -28,11 +28,120 @@
   // 拖拽检测
   let mapMouseDownPos = null;
 
+  // API 限流保护
+  let consecutiveFailures = 0;       // 连续失败计数
+  let apiSuspended = false;           // API 是否暂停
+  let cityLoadVersion = 0;            // 城市加载版本号（用于取消旧请求）
+  let lastRequestTime = 0;            // 上次请求时间戳
+
+  // ========== localStorage 缓存管理模块 ==========
+  const CACHE_KEY = 'travel_city_cache';
+  const CACHE_EXPIRE_MS = 7 * 24 * 60 * 60 * 1000; // 7 天
+
+  const CityCache = {
+    // 读取全部缓存
+    _readAll() {
+      try {
+        const raw = localStorage.getItem(CACHE_KEY);
+        if (!raw) return {};
+        const parsed = JSON.parse(raw);
+        if (typeof parsed !== 'object' || parsed === null) {
+          localStorage.removeItem(CACHE_KEY);
+          return {};
+        }
+        return parsed;
+      } catch (e) {
+        console.warn('缓存数据损坏，已清除:', e);
+        localStorage.removeItem(CACHE_KEY);
+        return {};
+      }
+    },
+
+    // 写入全部缓存
+    _writeAll(data) {
+      try {
+        localStorage.setItem(CACHE_KEY, JSON.stringify(data));
+      } catch (e) {
+        if (e.name === 'QuotaExceededError' || e.code === 22) {
+          // 存储空间不足，清除最早的缓存
+          this._evictOldest(data);
+          try {
+            localStorage.setItem(CACHE_KEY, JSON.stringify(data));
+          } catch (e2) {
+            console.warn('缓存写入失败（空间不足）:', e2);
+          }
+        } else {
+          console.warn('缓存写入失败:', e);
+        }
+      }
+    },
+
+    // 清除最早的缓存条目
+    _evictOldest(data) {
+      let oldestKey = null;
+      let oldestTime = Infinity;
+      for (const [key, val] of Object.entries(data)) {
+        if (val.timestamp && val.timestamp < oldestTime) {
+          oldestTime = val.timestamp;
+          oldestKey = key;
+        }
+      }
+      if (oldestKey) {
+        delete data[oldestKey];
+        console.log('已清除最早缓存:', oldestKey);
+      }
+    },
+
+    // 获取城市缓存（检查过期）
+    get(cityName) {
+      const all = this._readAll();
+      const entry = all[cityName];
+      if (!entry) return null;
+
+      // 检查数据完整性
+      if (!entry.center || !Array.isArray(entry.center) || !entry.arrivals) {
+        delete all[cityName];
+        this._writeAll(all);
+        return null;
+      }
+
+      // 检查过期
+      if (!entry.timestamp || (Date.now() - entry.timestamp > CACHE_EXPIRE_MS)) {
+        delete all[cityName];
+        this._writeAll(all);
+        return null;
+      }
+
+      return { center: entry.center, arrivals: entry.arrivals };
+    },
+
+    // 写入城市缓存
+    set(cityName, data) {
+      const all = this._readAll();
+      all[cityName] = {
+        center: data.center,
+        arrivals: data.arrivals,
+        timestamp: Date.now()
+      };
+      this._writeAll(all);
+    },
+
+    // 获取所有已缓存的城市名列表
+    getCachedCityNames() {
+      const all = this._readAll();
+      return Object.keys(all).filter(name => {
+        const entry = all[name];
+        return entry.timestamp && (Date.now() - entry.timestamp <= CACHE_EXPIRE_MS);
+      });
+    }
+  };
+
   // ---- DOM ----
   const $ = (s) => document.querySelector(s);
   const $$ = (s) => document.querySelectorAll(s);
 
-  const citySelect = $('#citySelect');
+  const cityInput = $('#cityInput');
+  const citySuggestions = $('#citySuggestions');
   const daysValue = $('#daysValue');
   const daysDown = $('#daysDown');
   const daysUp = $('#daysUp');
@@ -53,7 +162,7 @@
 
   // ========== 初始化 ==========
   function init() {
-    populateCities();
+    initCitySearch();
     initMap();
     bindEvents();
     updateBudgetDetail();
@@ -61,17 +170,13 @@
     setTimeout(() => loadCity(currentCity), 1000);
   }
 
-  function populateCities() {
-    ALL_CITIES.forEach(c => {
-      const opt = document.createElement('option');
-      opt.value = c;
-      opt.textContent = c;
-      citySelect.appendChild(opt);
-    });
-    citySelect.value = currentCity;
+  // 初始化城市搜索输入框
+  function initCitySearch() {
+    cityInput.value = currentCity;
   }
 
   function initMap() {
+    // 默认城市（北京）一定在预设数据中，直接使用
     const cityData = CITY_DATA[currentCity];
     try {
       map = new TMap.Map('mapContainer', {
@@ -132,7 +237,6 @@
   // 带重试的 POI 搜索（WebService API）
   async function searchPOI(cityName, keyword, category, retries) {
     if (retries === undefined) retries = 3;
-    const cityData = CITY_DATA[cityName];
     const url = 'https://apis.map.qq.com/ws/place/v1/search/?keyword=' +
       encodeURIComponent(keyword) +
       '&boundary=region(' + encodeURIComponent(cityName) + ',0)' +
@@ -265,13 +369,254 @@
     return el;
   }
 
-  // ========== 事件绑定 ==========
-  function bindEvents() {
-    citySelect.addEventListener('change', () => {
-      currentCity = citySelect.value;
-      closeItinerary();
-      loadCity(currentCity);
+  // ========== 城市数据线上获取 ==========
+
+  // 通过地理编码 API 获取城市中心坐标
+  async function geocodeCity(cityName) {
+    const url = 'https://apis.map.qq.com/ws/geocoder/v1/?address=' +
+      encodeURIComponent(cityName) +
+      '&key=' + API_KEY;
+
+    const result = await jsonp(url);
+    if (!result || result.status !== 0 || !result.result || !result.result.location) {
+      throw new Error('无法获取城市坐标: ' + (result && result.message || '未知错误'));
+    }
+
+    return {
+      lat: result.result.location.lat,
+      lng: result.result.location.lng
+    };
+  }
+
+  // 搜索城市交通枢纽（机场、高铁站、火车站）
+  async function fetchTransportHubs(cityName) {
+    const hubTypes = [
+      { keyword: '机场', type: '机场' },
+      { keyword: '高铁站', type: '高铁站' },
+      { keyword: '火车站', type: '火车站' }
+    ];
+
+    const arrivals = [];
+
+    for (const hub of hubTypes) {
+      // 确保请求间隔
+      await throttleRequest();
+      const url = 'https://apis.map.qq.com/ws/place/v1/search/?keyword=' +
+        encodeURIComponent(hub.keyword) +
+        '&boundary=region(' + encodeURIComponent(cityName) + ',0)' +
+        '&page_size=5&page_index=1&key=' + API_KEY;
+
+      try {
+        const result = await jsonp(url);
+        if (result && result.status === 0 && result.data && result.data.length > 0) {
+          // 过滤出真正属于该城市的交通枢纽
+          result.data.forEach(poi => {
+            // 避免重复
+            if (!arrivals.some(a => a.name === poi.title)) {
+              arrivals.push({
+                name: poi.title,
+                lat: poi.location.lat,
+                lng: poi.location.lng,
+                type: hub.type
+              });
+            }
+          });
+        }
+      } catch (e) {
+        console.warn(`搜索${cityName}${hub.keyword}失败:`, e.message);
+        recordApiFailure();
+      }
+    }
+
+    return arrivals;
+  }
+
+  // 完整的城市数据线上获取
+  async function fetchCityDataOnline(cityName) {
+    const loadingEl = showSearchStatus('正在获取城市数据...');
+
+    try {
+      // 1. 获取城市中心坐标
+      await throttleRequest();
+      const location = await geocodeCity(cityName);
+      resetApiFailures();
+
+      // 2. 获取交通枢纽
+      const arrivals = await fetchTransportHubs(cityName);
+
+      // 3. 组装数据
+      const cityData = {
+        center: [location.lng, location.lat],
+        arrivals: arrivals
+      };
+
+      // 4. 如果没有交通枢纽，添加城市中心作为默认到达点
+      if (arrivals.length === 0) {
+        cityData.arrivals = [{
+          name: cityName + '市中心',
+          lat: location.lat,
+          lng: location.lng,
+          type: '城市中心'
+        }];
+        showSearchStatus('⚠️ 未找到该城市的交通枢纽信息，已使用城市中心作为到达点');
+        setTimeout(() => {
+          const tip = document.querySelector('.search-status');
+          if (tip) tip.remove();
+        }, 4000);
+      }
+
+      // 5. 写入缓存
+      CityCache.set(cityName, cityData);
+
+      return cityData;
+    } catch (e) {
+      recordApiFailure();
+      throw e;
+    } finally {
+      if (loadingEl) loadingEl.remove();
+    }
+  }
+
+  // ========== 三级数据源查询 ==========
+  async function getCityData(cityName) {
+    // 第一级：预设数据
+    if (CITY_DATA[cityName]) {
+      return CITY_DATA[cityName];
+    }
+
+    // 第二级：本地缓存
+    const cached = CityCache.get(cityName);
+    if (cached) {
+      return cached;
+    }
+
+    // 检查 API 是否暂停
+    if (apiSuspended) {
+      throw new Error('API 服务暂时不可用，请稍后重试，或选择预设的热门城市');
+    }
+
+    // 第三级：线上获取
+    try {
+      return await fetchCityDataOnline(cityName);
+    } catch (e) {
+      // 降级：如果预设数据存在则使用
+      if (CITY_DATA[cityName]) {
+        return CITY_DATA[cityName];
+      }
+      throw new Error('获取城市数据失败: ' + e.message + '\n建议选择预设的热门城市');
+    }
+  }
+
+  // ========== API 限流保护 ==========
+
+  // 请求节流：确保每次请求间隔不少于 1 秒
+  async function throttleRequest() {
+    const now = Date.now();
+    const elapsed = now - lastRequestTime;
+    if (elapsed < 1000) {
+      await delay(1000 - elapsed);
+    }
+    lastRequestTime = Date.now();
+  }
+
+  // 记录 API 失败
+  function recordApiFailure() {
+    consecutiveFailures++;
+    if (consecutiveFailures >= 5) {
+      apiSuspended = true;
+      showSearchStatus('⚠️ API 服务暂时不可用，请稍后重试');
+      setTimeout(() => {
+        const tip = document.querySelector('.search-status');
+        if (tip) tip.remove();
+      }, 5000);
+      // 30 秒后自动恢复
+      setTimeout(() => {
+        apiSuspended = false;
+        consecutiveFailures = 0;
+      }, 30000);
+    }
+  }
+
+  // 重置失败计数
+  function resetApiFailures() {
+    consecutiveFailures = 0;
+    apiSuspended = false;
+  }
+
+  // ========== 城市搜索建议 ==========
+
+  // 通过行政区划 API 搜索城市
+  async function searchCitySuggestions(keyword) {
+    if (!keyword || keyword.length === 0) return [];
+
+    // 先从预设城市和缓存中匹配
+    const localResults = [];
+    const cachedNames = CityCache.getCachedCityNames();
+    const allKnownCities = [...new Set([...ALL_CITIES, ...cachedNames])];
+
+    allKnownCities.forEach(name => {
+      if (name.includes(keyword)) {
+        localResults.push({
+          name: name,
+          isPreset: ALL_CITIES.includes(name),
+          isCached: cachedNames.includes(name)
+        });
+      }
     });
+
+    // 预设城市排在前面
+    localResults.sort((a, b) => {
+      if (a.isPreset && !b.isPreset) return -1;
+      if (!a.isPreset && b.isPreset) return 1;
+      return 0;
+    });
+
+    // 如果本地结果足够多，不发起 API 请求
+    if (localResults.length >= 5 || apiSuspended) {
+      return localResults.slice(0, 10);
+    }
+
+    // 线上搜索补充
+    try {
+      await throttleRequest();
+      const url = 'https://apis.map.qq.com/ws/district/v1/search?keyword=' +
+        encodeURIComponent(keyword) +
+        '&key=' + API_KEY;
+
+      const result = await jsonp(url);
+      resetApiFailures();
+
+      if (result && result.status === 0 && result.result && result.result[0]) {
+        const districts = result.result[0];
+        districts.forEach(d => {
+          // 仅保留城市级别（地级市及以上），过滤区/县/街道
+          // cidx 数组存在表示有子级行政区，fullname 包含"市"表示是城市
+          const cityName = d.fullname.replace(/市$/, '');
+          if (!localResults.some(r => r.name === cityName) && !localResults.some(r => r.name === d.fullname)) {
+            const name = ALL_CITIES.includes(cityName) ? cityName : (ALL_CITIES.includes(d.fullname) ? d.fullname : cityName);
+            localResults.push({
+              name: name,
+              isPreset: ALL_CITIES.includes(name),
+              isCached: false
+            });
+          }
+        });
+      }
+    } catch (e) {
+      console.warn('城市搜索建议 API 失败:', e.message);
+      recordApiFailure();
+    }
+
+    return localResults.slice(0, 10);
+  }
+
+  // ========== 事件绑定 ==========
+  let searchDebounceTimer = null;
+  let suggestionsVisible = false;
+
+  function bindEvents() {
+    // 城市搜索输入框事件
+    bindCitySearchEvents();
 
     daysDown.addEventListener('click', () => {
       if (days > 1) { days--; daysValue.textContent = days; }
@@ -300,11 +645,20 @@
 
     document.addEventListener('keydown', (e) => {
       if (e.key === 'Escape') {
-        if (modalOverlay.style.display === 'flex') {
+        if (suggestionsVisible) {
+          hideSuggestions();
+        } else if (modalOverlay.style.display === 'flex') {
           closeModal();
         } else if (itineraryPanel.style.display === 'flex') {
           closeItinerary();
         }
+      }
+    });
+
+    // 点击外部关闭建议列表
+    document.addEventListener('click', (e) => {
+      if (!e.target.closest('#citySearchWrapper')) {
+        hideSuggestions();
       }
     });
 
@@ -323,6 +677,163 @@
     });
   }
 
+  // 城市搜索输入框事件绑定
+  function bindCitySearchEvents() {
+    // 输入事件（带防抖）
+    cityInput.addEventListener('input', () => {
+      const keyword = cityInput.value.trim();
+      if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
+
+      if (!keyword) {
+        // 空输入时显示热门城市
+        showHotCities();
+        return;
+      }
+
+      searchDebounceTimer = setTimeout(async () => {
+        const suggestions = await searchCitySuggestions(keyword);
+        renderSuggestions(suggestions, keyword);
+      }, 300);
+    });
+
+    // 聚焦时显示建议
+    cityInput.addEventListener('focus', () => {
+      const keyword = cityInput.value.trim();
+      if (!keyword || keyword === currentCity) {
+        showHotCities();
+      } else {
+        // 触发一次搜索
+        cityInput.dispatchEvent(new Event('input'));
+      }
+    });
+
+    // 失焦时恢复上次选择
+    cityInput.addEventListener('blur', (e) => {
+      // 延迟关闭，以便点击建议项时能先触发
+      setTimeout(() => {
+        if (suggestionsVisible) {
+          hideSuggestions();
+        }
+        // 恢复上次选择的城市名
+        cityInput.value = currentCity;
+      }, 200);
+    });
+
+    // 键盘导航
+    cityInput.addEventListener('keydown', (e) => {
+      if (!suggestionsVisible) return;
+
+      const items = citySuggestions.querySelectorAll('.city-suggestion-item');
+      const activeItem = citySuggestions.querySelector('.city-suggestion-item.active');
+      let activeIdx = -1;
+      items.forEach((item, i) => { if (item === activeItem) activeIdx = i; });
+
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        const nextIdx = activeIdx < items.length - 1 ? activeIdx + 1 : 0;
+        items.forEach(item => item.classList.remove('active'));
+        items[nextIdx].classList.add('active');
+        items[nextIdx].scrollIntoView({ block: 'nearest' });
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        const prevIdx = activeIdx > 0 ? activeIdx - 1 : items.length - 1;
+        items.forEach(item => item.classList.remove('active'));
+        items[prevIdx].classList.add('active');
+        items[prevIdx].scrollIntoView({ block: 'nearest' });
+      } else if (e.key === 'Enter') {
+        e.preventDefault();
+        if (activeItem) {
+          selectCity(activeItem.dataset.city);
+        } else if (items.length > 0) {
+          selectCity(items[0].dataset.city);
+        }
+      }
+    });
+  }
+
+  // 显示热门城市推荐
+  function showHotCities() {
+    const suggestions = ALL_CITIES.map(name => ({
+      name: name,
+      isPreset: true,
+      isCached: false
+    }));
+    renderSuggestions(suggestions, '', '🔥 热门城市');
+  }
+
+  // 渲染建议列表
+  function renderSuggestions(suggestions, keyword, headerText) {
+    citySuggestions.innerHTML = '';
+
+    if (suggestions.length === 0) {
+      citySuggestions.innerHTML = '<div class="city-suggestion-empty">😕 未找到匹配城市</div>';
+      citySuggestions.classList.add('visible');
+      suggestionsVisible = true;
+      return;
+    }
+
+    if (headerText) {
+      const header = document.createElement('div');
+      header.className = 'city-suggestion-header';
+      header.textContent = headerText;
+      citySuggestions.appendChild(header);
+    }
+
+    suggestions.forEach(s => {
+      const item = document.createElement('div');
+      item.className = 'city-suggestion-item';
+      item.dataset.city = s.name;
+
+      // 高亮匹配文字
+      let nameHtml = s.name;
+      if (keyword) {
+        const idx = s.name.indexOf(keyword);
+        if (idx >= 0) {
+          nameHtml = s.name.substring(0, idx) +
+            '<strong style="color:var(--c-primary)">' + keyword + '</strong>' +
+            s.name.substring(idx + keyword.length);
+        }
+      }
+
+      let tagHtml = '';
+      if (s.isPreset) {
+        tagHtml = '<span class="city-tag preset">推荐</span>';
+      } else if (s.isCached) {
+        tagHtml = '<span class="city-tag cached">已缓存</span>';
+      }
+
+      item.innerHTML = '<span>' + nameHtml + '</span>' + tagHtml;
+
+      item.addEventListener('mousedown', (e) => {
+        e.preventDefault(); // 阻止 blur 事件
+        selectCity(s.name);
+      });
+
+      citySuggestions.appendChild(item);
+    });
+
+    citySuggestions.classList.add('visible');
+    suggestionsVisible = true;
+  }
+
+  // 隐藏建议列表
+  function hideSuggestions() {
+    citySuggestions.classList.remove('visible');
+    suggestionsVisible = false;
+  }
+
+  // 选择城市
+  function selectCity(cityName) {
+    hideSuggestions();
+    cityInput.value = cityName;
+    if (cityName !== currentCity) {
+      currentCity = cityName;
+      closeItinerary();
+      loadCity(currentCity);
+    }
+    cityInput.blur();
+  }
+
   // ========== 预算详情 ==========
   function updateBudgetDetail() {
     const b = BUDGET_CONFIG[budget];
@@ -330,29 +841,48 @@
       `住宿 ≈ ¥${b.hotel}/晚 · 餐饮 ≈ ¥${b.food}/天<br>交通 ≈ ¥${b.transport}/天 · 门票 ≈ ¥${b.ticket}/天`;
   }
 
-  // ========== 加载城市 ==========
-  function loadCity(name) {
-    const city = CITY_DATA[name];
-    if (!city || !map) return;
+  // ========== 加载城市（异步版） ==========
+  async function loadCity(name) {
+    if (!map) return;
 
-    map.setCenter(new TMap.LatLng(city.center[1], city.center[0]));
-    map.setZoom(12);
+    // 城市切换取消机制
+    const version = ++cityLoadVersion;
 
-    arrivalSelect.innerHTML = '';
-    city.arrivals.forEach((a, i) => {
-      const opt = document.createElement('option');
-      opt.value = i;
-      opt.textContent = `${a.name}（${a.type}）`;
-      arrivalSelect.appendChild(opt);
-    });
+    try {
+      const city = await getCityData(name);
 
-    clearAllMarkers();
+      // 检查是否已被更新的请求取代
+      if (cityLoadVersion !== version) return;
 
-    // 异步加载 POI 并绘制标记
-    fetchCityPOI(name).then(poiData => {
-      if (currentCity !== name) return; // 城市已切换
-      drawMarkers(city, poiData);
-    });
+      map.setCenter(new TMap.LatLng(city.center[1], city.center[0]));
+      map.setZoom(12);
+
+      arrivalSelect.innerHTML = '';
+      if (city.arrivals && city.arrivals.length > 0) {
+        city.arrivals.forEach((a, i) => {
+          const opt = document.createElement('option');
+          opt.value = i;
+          opt.textContent = `${a.name}（${a.type}）`;
+          arrivalSelect.appendChild(opt);
+        });
+      }
+
+      clearAllMarkers();
+
+      // 异步加载 POI 并绘制标记
+      fetchCityPOI(name).then(poiData => {
+        if (currentCity !== name || cityLoadVersion !== version) return;
+        drawMarkers(city, poiData);
+      });
+    } catch (e) {
+      if (cityLoadVersion !== version) return;
+      console.error('加载城市失败:', e);
+      showSearchStatus('⚠️ ' + e.message);
+      setTimeout(() => {
+        const tip = document.querySelector('.search-status');
+        if (tip) tip.remove();
+      }, 5000);
+    }
   }
 
   // ========== 标记管理 ==========
@@ -520,7 +1050,8 @@
     loadingOverlay.style.display = 'flex';
 
     try {
-      const city = CITY_DATA[currentCity];
+      // 通过三级数据源获取城市数据
+      const city = await getCityData(currentCity);
       if (!city) throw new Error('城市数据不存在');
 
       const poiData = await fetchCityPOI(currentCity);

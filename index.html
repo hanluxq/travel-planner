@@ -21,7 +21,12 @@
 
   <div class="config-section">
     <label class="config-label">🏙️ 目的地</label>
-    <select id="citySelect" class="config-select" aria-label="选择目的地城市"></select>
+    <div class="city-search-wrapper" id="citySearchWrapper">
+      <input type="text" id="cityInput" class="config-input" placeholder="搜索城市..." autocomplete="off" aria-label="搜索目的地城市"
+        value="北京">
+      <span class="city-search-icon">🔍</span>
+      <div class="city-suggestions" id="citySuggestions"></div>
+    </div>
   </div>
 
   <div class="config-section">

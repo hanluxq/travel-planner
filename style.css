@@ -161,6 +161,143 @@ body { display: flex; overflow: hidden; }
 .config-select:hover { border-color: var(--c-primary-muted); }
 .config-select:focus { border-color: var(--c-primary); box-shadow: 0 0 0 3px var(--c-primary-soft); }
 
+/* --- 城市搜索输入框 --- */
+.city-search-wrapper {
+  position: relative;
+}
+
+.config-input {
+  width: 100%;
+  padding: 10px 36px 10px 14px;
+  border: 1.5px solid var(--c-border);
+  border-radius: var(--r-sm);
+  font-size: 14px;
+  font-weight: 500;
+  background: var(--c-bg);
+  color: var(--c-text);
+  outline: none;
+  cursor: text;
+  transition: all var(--dur) var(--ease);
+}
+
+.config-input::placeholder {
+  color: var(--c-text-tertiary);
+  font-weight: 400;
+}
+
+.config-input:hover {
+  border-color: var(--c-primary-muted);
+}
+
+.config-input:focus {
+  border-color: var(--c-primary);
+  box-shadow: 0 0 0 3px var(--c-primary-soft);
+}
+
+.city-search-icon {
+  position: absolute;
+  right: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 14px;
+  pointer-events: none;
+  opacity: .5;
+}
+
+/* --- 城市建议列表 --- */
+.city-suggestions {
+  display: none;
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  max-height: 300px;
+  overflow-y: auto;
+  background: var(--c-surface);
+  border: 1.5px solid var(--c-border);
+  border-radius: var(--r-sm);
+  box-shadow: var(--shadow-lg);
+  z-index: 1000;
+}
+
+.city-suggestions.visible {
+  display: block;
+}
+
+.city-suggestions::-webkit-scrollbar {
+  width: 4px;
+}
+
+.city-suggestions::-webkit-scrollbar-thumb {
+  background: var(--c-border);
+  border-radius: 2px;
+}
+
+.city-suggestions::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.city-suggestion-header {
+  padding: 8px 14px 4px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--c-text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: .5px;
+  border-bottom: 1px solid var(--c-border-light);
+}
+
+.city-suggestion-item {
+  padding: 10px 14px;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all .15s var(--ease);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--c-text);
+  border-bottom: 1px solid var(--c-border-light);
+}
+
+.city-suggestion-item:last-child {
+  border-bottom: none;
+}
+
+.city-suggestion-item:hover {
+  background: var(--c-primary-soft);
+  color: var(--c-primary);
+}
+
+.city-suggestion-item.active {
+  background: var(--c-primary-soft);
+  color: var(--c-primary);
+}
+
+.city-suggestion-item .city-tag {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: var(--r-full);
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.city-tag.preset {
+  background: #dbeafe;
+  color: var(--c-primary);
+}
+
+.city-tag.cached {
+  background: #d1fae5;
+  color: #059669;
+}
+
+.city-suggestion-empty {
+  padding: 20px 14px;
+  text-align: center;
+  font-size: 13px;
+  color: var(--c-text-tertiary);
+}
 /* --- 天数控制 --- */
 .days-control {
   display: flex;
