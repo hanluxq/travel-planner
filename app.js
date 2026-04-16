@@ -168,8 +168,18 @@
     initMap();
     bindEvents();
     updateBudgetDetail();
+    initOfflineDetection();
+    // 首次访问新手引导
+    setTimeout(() => showOnboarding(), 1500);
     // 延迟加载 POI，等地图 SDK 完全就绪
-    setTimeout(() => loadCity(currentCity), 1000);
+    setTimeout(() => {
+      // 优先从 URL 恢复行程
+      if (!restoreFromUrl()) {
+        loadCity(currentCity);
+        // 检查是否有已保存的行程
+        setTimeout(() => promptRestoreItinerary(), 2000);
+      }
+    }, 1000);
   }
 
   // 填充城市下拉菜单（全部预设城市）
@@ -189,7 +199,18 @@
   }
 
   function initMap() {
-    // 默认城市（北京）一定在预设数据中，直接使用
+    // 检测腾讯地图 SDK 是否加载成功
+    if (typeof TMap === 'undefined') {
+      console.error('腾讯地图 SDK 未加载');
+      mapContainer.innerHTML = `<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;color:#64748b;font-size:16px;gap:12px;padding:20px;text-align:center;">
+        <span style="font-size:48px;">🗺️</span>
+        <p style="font-weight:700;font-size:18px;color:#0f172a;">地图加载失败</p>
+        <p>腾讯地图 SDK 未能加载，可能是网络问题。</p>
+        <button onclick="location.reload()" style="padding:10px 24px;background:#2563eb;color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;">刷新重试</button>
+      </div>`;
+      return;
+    }
+
     const cityData = CITY_DATA[currentCity];
     try {
       map = new TMap.Map('mapContainer', {
@@ -199,7 +220,12 @@
       });
     } catch (e) {
       console.error('地图初始化失败:', e);
-      mapContainer.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#64748b;font-size:16px;">地图加载失败，请刷新页面重试</div>';
+      mapContainer.innerHTML = `<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;color:#64748b;font-size:16px;gap:12px;padding:20px;text-align:center;">
+        <span style="font-size:48px;">⚠️</span>
+        <p style="font-weight:700;font-size:18px;color:#0f172a;">地图初始化失败</p>
+        <p>${e.message || '请刷新页面重试'}</p>
+        <button onclick="location.reload()" style="padding:10px 24px;background:#2563eb;color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;">刷新重试</button>
+      </div>`;
     }
   }
 
@@ -274,7 +300,11 @@
           address: poi.address || '',
           category: poi.category || category,
           tel: poi.tel || '',
-          type: category
+          type: category,
+          // 保留 API 原始扩展字段，用于提取真实数据
+          _raw_id: poi.id || '',
+          _raw_category: poi.category || '',
+          _raw_type: poi.type || 0
         }));
       } catch (e) {
         if (attempt < retries) {
@@ -300,38 +330,70 @@
       await delay(1200);
       const hotelsRaw = await enqueueRequest(() => searchPOI(cityName, '酒店', '酒店'));
 
-      // 去重 + 转换景点数据
+      // 新增：搜索餐厅 POI
+      await delay(1200);
+      const restaurantsRaw = await enqueueRequest(() => searchPOI(cityName, '美食餐厅', '餐厅'));
+
+      // 去重 + 转换景点数据（基于真实 API 数据推断，不使用随机值）
       const seenNames = new Set();
       const sights = sightsRaw.filter(s => {
         if (seenNames.has(s.name)) return false;
         seenNames.add(s.name);
         return true;
-      }).slice(0, 15).map(s => ({
-        ...s,
-        rating: +(4 + Math.random() * 0.9).toFixed(1),
-        price: Math.floor(Math.random() * 120),
-        duration: `${1 + Math.floor(Math.random() * 3)}-${3 + Math.floor(Math.random() * 2)}小时`,
-        type: s.category || '景点'
-      }));
+      }).slice(0, 15).map(s => {
+        const sightType = inferSightType(s._raw_category, s.name);
+        const durationInfo = estimateVisitDuration(sightType, s.name);
+        const priceInfo = estimateSightPrice(sightType, s.name);
+        return {
+          ...s,
+          rating: null, // 暂无评分 — 腾讯地图 POI 搜索不返回评分
+          ratingSource: 'none',
+          price: priceInfo.price,
+          priceSource: priceInfo.source, // 'estimated'
+          duration: durationInfo.text,
+          durationMinutes: durationInfo.minutes, // 用于行程时间计算
+          type: sightType
+        };
+      });
 
-      // 转换酒店数据：根据名称关键词推断价格等级
+      // 转换酒店数据：根据名称关键词推断价格等级，标注为估算价格
       const hotelNames = new Set();
       const hotels = hotelsRaw.filter(h => {
         if (hotelNames.has(h.name)) return false;
         hotelNames.add(h.name);
         return true;
       }).slice(0, 10).map((h, i) => {
-        const tier = getHotelTier(h.name, i);
+        const tier = getHotelTier(h.name, i, h._raw_category);
         return {
           ...h,
-          rating: +(3.8 + Math.random() * 1.1).toFixed(1),
+          rating: null, // 暂无评分 — 腾讯地图 POI 搜索不返回评分
+          ratingSource: 'none',
           price: tier.price,
+          priceSource: 'estimated', // 所有酒店价格均为估算
           type: tier.type,
           stars: tier.stars
         };
       });
 
-      const data = { sights, hotels };
+      // 转换餐厅数据：去重 + 推断人均消费
+      const restNames = new Set();
+      const restaurants = restaurantsRaw.filter(r => {
+        if (restNames.has(r.name)) return false;
+        restNames.add(r.name);
+        return true;
+      }).slice(0, 15).map(r => {
+        const avgPrice = estimateRestaurantPrice(r.name, r._raw_category);
+        return {
+          ...r,
+          rating: null,
+          ratingSource: 'none',
+          price: avgPrice,
+          priceSource: 'estimated',
+          type: '餐厅'
+        };
+      });
+
+      const data = { sights, hotels, restaurants };
 
       if (sights.length === 0 && hotels.length === 0) {
         showSearchStatus('⚠️ POI 搜索无结果，可能是 API Key 限流，请稍后重试或更换 Key');
@@ -352,25 +414,197 @@
     }
   }
 
-  // 根据酒店名称关键词和排序位推断等级
-  function getHotelTier(name, index) {
-    const luxuryKeywords = ['丽思', '万豪', '希尔顿', '洲际', '香格里拉', '华尔道夫', '柏悦', '安缦', '四季', '半岛', '文华东方', '瑰丽', '费尔蒙', '宝格丽', '丽晶'];
-    const comfortKeywords = ['喜来登', '威斯汀', '凯悦', '皇冠假日', '索菲特', '铂尔曼', '诺富特', '雅高', '假日'];
-    const budgetKeywords = ['如家', '7天', '汉庭', '速8', '格林豪泰', '锦江之星', '莫泰'];
+  // ========== 景点数据智能推断（消除随机数据） ==========
+
+  // 根据 API 返回的 category 和名称推断景点类型
+  function inferSightType(rawCategory, name) {
+    const cat = (rawCategory || '').toLowerCase();
+    const n = name || '';
+
+    // 按关键词匹配景点类型
+    const typeRules = [
+      { type: '博物馆', keywords: ['博物', '纪念馆', '展览', '美术馆', '科技馆', '天文馆', '艺术馆'] },
+      { type: '寺庙', keywords: ['寺', '庙', '观', '庵', '祠', '教堂', '清真'] },
+      { type: '公园', keywords: ['公园', '花园', '植物园', '动物园', '湿地', '森林', '绿地'] },
+      { type: '古镇', keywords: ['古镇', '古城', '古村', '老街', '古街', '水乡'] },
+      { type: '山岳', keywords: ['山', '峰', '岭', '崖', '峡谷', '峡', '岩'] },
+      { type: '湖泊', keywords: ['湖', '海', '江', '河', '溪', '泉', '瀑布', '水库'] },
+      { type: '主题乐园', keywords: ['乐园', '游乐', '欢乐谷', '迪士尼', '环球', '方特', '海洋世界'] },
+      { type: '历史遗迹', keywords: ['遗址', '故居', '陵', '墓', '城墙', '长城', '故宫', '皇宫', '王府'] },
+      { type: '商业街区', keywords: ['步行街', '商业街', '夜市', '美食街', '购物'] },
+      { type: '自然风景', keywords: ['风景', '景区', '名胜', '地质', '草原', '沙漠', '冰川'] }
+    ];
+
+    // 先匹配 category 字段
+    for (const rule of typeRules) {
+      if (rule.keywords.some(k => cat.includes(k))) return rule.type;
+    }
+    // 再匹配名称
+    for (const rule of typeRules) {
+      if (rule.keywords.some(k => n.includes(k))) return rule.type;
+    }
+
+    return '景点'; // 默认类型
+  }
+
+  // 根据景点类型估算合理的游览时长（分钟）
+  function estimateVisitDuration(sightType, name) {
+    const durationMap = {
+      '博物馆': { min: 120, max: 180, text: '2-3小时' },
+      '寺庙': { min: 60, max: 120, text: '1-2小时' },
+      '公园': { min: 90, max: 150, text: '1.5-2.5小时' },
+      '古镇': { min: 180, max: 240, text: '3-4小时' },
+      '山岳': { min: 180, max: 300, text: '3-5小时' },
+      '湖泊': { min: 90, max: 150, text: '1.5-2.5小时' },
+      '主题乐园': { min: 240, max: 360, text: '4-6小时' },
+      '历史遗迹': { min: 120, max: 180, text: '2-3小时' },
+      '商业街区': { min: 90, max: 150, text: '1.5-2.5小时' },
+      '自然风景': { min: 120, max: 240, text: '2-4小时' },
+      '景点': { min: 90, max: 150, text: '1.5-2.5小时' }
+    };
+
+    const info = durationMap[sightType] || durationMap['景点'];
+    // 使用中位数作为计算用时长
+    const minutes = Math.round((info.min + info.max) / 2);
+    return { text: info.text, minutes };
+  }
+
+  // 根据景点类型估算门票价格区间
+  function estimateSightPrice(sightType, name) {
+    const priceMap = {
+      '博物馆': { price: 0, note: '多数免费' },
+      '寺庙': { price: 30, note: '' },
+      '公园': { price: 0, note: '多数免费' },
+      '古镇': { price: 80, note: '' },
+      '山岳': { price: 120, note: '' },
+      '湖泊': { price: 50, note: '' },
+      '主题乐园': { price: 280, note: '' },
+      '历史遗迹': { price: 60, note: '' },
+      '商业街区': { price: 0, note: '免费' },
+      '自然风景': { price: 80, note: '' },
+      '景点': { price: 40, note: '' }
+    };
+
+    // 特殊景点名称匹配（知名免费景点）
+    const freeKeywords = ['广场', '步行街', '外滩', '天安门', '鼓楼', '钟楼'];
+    if (freeKeywords.some(k => name.includes(k))) {
+      return { price: 0, source: 'estimated' };
+    }
+
+    const info = priceMap[sightType] || priceMap['景点'];
+    return { price: info.price, source: 'estimated' };
+  }
+
+  // 根据餐厅名称和类别估算人均消费
+  function estimateRestaurantPrice(name, rawCategory) {
+    const cat = (rawCategory || '').toLowerCase();
+    const n = name || '';
+
+    // 高档餐厅关键词
+    const highEnd = ['米其林', '私房', '会所', '料理', '法餐', '意大利', '铁板烧', '怀石', '鲍鱼', '海鲜大餐'];
+    if (highEnd.some(k => n.includes(k) || cat.includes(k))) return 300;
+
+    // 中档餐厅关键词
+    const midRange = ['火锅', '烤肉', '日料', '西餐', '牛排', '海鲜', '粤菜', '川菜', '湘菜', '东北菜', '本帮菜'];
+    if (midRange.some(k => n.includes(k) || cat.includes(k))) return 100;
+
+    // 快餐/小吃关键词
+    const budget = ['面馆', '粉', '小吃', '快餐', '麦当劳', '肯德基', '饺子', '包子', '煎饼', '拉面', '米线', '沙县'];
+    if (budget.some(k => n.includes(k) || cat.includes(k))) return 30;
+
+    // 默认中等消费
+    return 70;
+  }
+
+  // 从餐厅列表中找到距离参考点最近且未使用过的餐厅
+  function findNearestRestaurant(restaurants, refPoint, usedSet) {
+    if (!restaurants || restaurants.length === 0 || !refPoint) return null;
+    let best = null;
+    let bestDist = Infinity;
+    for (const r of restaurants) {
+      if (usedSet && usedSet.has(r.name)) continue;
+      const dist = geoDistance(refPoint.lat, refPoint.lng, r.lat, r.lng);
+      if (dist < bestDist) {
+        bestDist = dist;
+        best = r;
+      }
+    }
+    return best;
+  }
+
+  // 根据酒店名称关键词、排序位和 API 类别推断等级（价格为固定估算值，不使用随机数）
+  function getHotelTier(name, index, rawCategory) {
+    const luxuryKeywords = ['丽思', '万豪', '希尔顿', '洲际', '香格里拉', '华尔道夫', '柏悦', '安缦', '四季', '半岛', '文华东方', '瑰丽', '费尔蒙', '宝格丽', '丽晶', '君悦', 'W酒店', '维景', '威斯汀', '奥菱'];
+    const comfortKeywords = ['喜来登', '威斯汀', '凯悦', '皇冠假日', '索菲特', '铂尔曼', '诺富特', '雅高', '假日', '嘉里大', '华美达', '维也纳', '开元', '满堂红', '建国饭店', '嘉实多'];
+    const budgetKeywords = ['如家', '7天', '汉庭', '速8', '格林豪泰', '锦江之星', '莫泰', '尚客优', '维也纳好睡', '全季', '首旅', '尚客优品', '尚客优选', '久久鸿基'];
 
     if (luxuryKeywords.some(k => name.includes(k))) {
-      return { type: '豪华', price: 1200 + Math.floor(Math.random() * 1500), stars: 5 };
+      return { type: '豪华', price: 1500, stars: 5 };
     }
     if (comfortKeywords.some(k => name.includes(k))) {
-      return { type: '舒适', price: 500 + Math.floor(Math.random() * 500), stars: 4 };
+      return { type: '舒适', price: 600, stars: 4 };
     }
     if (budgetKeywords.some(k => name.includes(k))) {
-      return { type: '经济', price: 150 + Math.floor(Math.random() * 150), stars: 2 };
+      return { type: '经济', price: 200, stars: 2 };
     }
-    // 搜索结果排名靠前的通常是较知名酒店
-    if (index < 3) return { type: '豪华', price: 800 + Math.floor(Math.random() * 1000), stars: 5 };
-    if (index < 6) return { type: '标准', price: 350 + Math.floor(Math.random() * 250), stars: 3 };
-    return { type: '经济', price: 150 + Math.floor(Math.random() * 150), stars: 2 };
+
+    // 根据 API 返回的 category 字段推断
+    const cat = (rawCategory || '').toLowerCase();
+    if (cat.includes('五星') || cat.includes('豪华') || cat.includes('高档')) {
+      return { type: '豪华', price: 1200, stars: 5 };
+    }
+    if (cat.includes('四星') || cat.includes('舒适')) {
+      return { type: '舒适', price: 500, stars: 4 };
+    }
+    if (cat.includes('经济') || cat.includes('快捷') || cat.includes('青年旅舍')) {
+      return { type: '经济', price: 180, stars: 2 };
+    }
+
+    // 根据搜索结果排名推断（固定价格，不用随机数）
+    if (index < 3) return { type: '豪华', price: 1000, stars: 5 };
+    if (index < 6) return { type: '标准', price: 400, stars: 3 };
+    return { type: '经济', price: 200, stars: 2 };
+  }
+
+  // ========== Toast 通知系统 ==========
+  const toastIcons = { success: '✅', warning: '⚠️', error: '❌', info: 'ℹ️' };
+
+  function showToast(message, type, duration) {
+    type = type || 'info';
+    duration = duration || 4000;
+    const container = document.getElementById('toastContainer');
+    if (!container) return;
+
+    const toast = document.createElement('div');
+    toast.className = `toast toast-${type}`;
+    toast.innerHTML = `<span class="toast-icon">${toastIcons[type] || toastIcons.info}</span>` +
+      `<span class="toast-msg">${message}</span>` +
+      `<button class="toast-close" aria-label="关闭">&times;</button>`;
+
+    container.appendChild(toast);
+
+    // 关闭按钮
+    toast.querySelector('.toast-close').addEventListener('click', () => removeToast(toast));
+
+    // 自动消失
+    const timer = setTimeout(() => removeToast(toast), duration);
+    toast._timer = timer;
+
+    // 最多同时显示 5 条
+    while (container.children.length > 5) {
+      removeToast(container.children[0]);
+    }
+
+    return toast;
+  }
+
+  function removeToast(toast) {
+    if (!toast || !toast.parentNode) return;
+    if (toast._timer) clearTimeout(toast._timer);
+    toast.classList.add('toast-out');
+    toast.addEventListener('animationend', () => {
+      if (toast.parentNode) toast.parentNode.removeChild(toast);
+    });
   }
 
   function showSearchStatus(msg) {
@@ -833,6 +1067,14 @@
     planBtn.addEventListener('click', startPlanning);
     panelClose.addEventListener('click', closeItinerary);
 
+    // 行程保存/分享/导出按钮
+    const saveBtn = $('#saveItineraryBtn');
+    const shareBtn = $('#shareItineraryBtn');
+    const exportBtn = $('#exportPdfBtn');
+    if (saveBtn) saveBtn.addEventListener('click', saveItinerary);
+    if (shareBtn) shareBtn.addEventListener('click', shareItinerary);
+    if (exportBtn) exportBtn.addEventListener('click', exportPdf);
+
     modalClose.addEventListener('click', closeModal);
     modalOverlay.addEventListener('click', (e) => { if (e.target === modalOverlay) closeModal(); });
 
@@ -868,6 +1110,110 @@
         resetHighlight();
       }
     });
+
+    // ========== 移动端底部抽屉手势 ==========
+    initMobileDrawer();
+  }
+
+  // ========== 离线检测与缓存降级 ==========
+  let isOffline = false;
+  let offlineBanner = null;
+
+  function initOfflineDetection() {
+    // 初始状态检测
+    if (!navigator.onLine) {
+      handleOffline();
+    }
+
+    // 监听在线/离线事件
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+  }
+
+  function handleOffline() {
+    if (isOffline) return;
+    isOffline = true;
+    showToast('⚠️ 网络已断开，将使用缓存数据提供服务', 'warning', 6000);
+    showOfflineBanner();
+  }
+
+  function handleOnline() {
+    if (!isOffline) return;
+    isOffline = false;
+    showToast('✅ 网络已恢复', 'success', 3000);
+    hideOfflineBanner();
+  }
+
+  function showOfflineBanner() {
+    if (offlineBanner) return;
+    offlineBanner = document.createElement('div');
+    offlineBanner.className = 'offline-banner';
+    offlineBanner.innerHTML = '📡 离线模式 — 部分功能受限，使用缓存数据';
+    document.body.appendChild(offlineBanner);
+  }
+
+  function hideOfflineBanner() {
+    if (offlineBanner) {
+      offlineBanner.remove();
+      offlineBanner = null;
+    }
+  }
+
+  // ========== 移动端底部抽屉 ==========
+  function initMobileDrawer() {
+    const sidebar = document.getElementById('sidebar');
+    if (!sidebar) return;
+
+    const isMobile = () => window.innerWidth <= 768;
+    let touchStartY = 0;
+    let touchCurrentY = 0;
+    let drawerOpen = false;
+
+    // 点击头部切换抽屉
+    const header = sidebar.querySelector('.sidebar-header');
+    if (header) {
+      header.addEventListener('click', () => {
+        if (!isMobile()) return;
+        drawerOpen = !drawerOpen;
+        sidebar.classList.toggle('drawer-open', drawerOpen);
+      });
+    }
+
+    // 触摸手势：上滑展开，下滑收起
+    sidebar.addEventListener('touchstart', (e) => {
+      if (!isMobile()) return;
+      touchStartY = e.touches[0].clientY;
+    }, { passive: true });
+
+    sidebar.addEventListener('touchmove', (e) => {
+      if (!isMobile()) return;
+      touchCurrentY = e.touches[0].clientY;
+    }, { passive: true });
+
+    sidebar.addEventListener('touchend', () => {
+      if (!isMobile()) return;
+      const deltaY = touchStartY - touchCurrentY;
+      if (Math.abs(deltaY) > 40) {
+        if (deltaY > 0) {
+          // 上滑 → 展开
+          drawerOpen = true;
+          sidebar.classList.add('drawer-open');
+        } else {
+          // 下滑 → 收起
+          drawerOpen = false;
+          sidebar.classList.remove('drawer-open');
+        }
+      }
+      touchStartY = 0;
+      touchCurrentY = 0;
+    }, { passive: true });
+
+    // 点击地图区域时收起抽屉
+    mapContainer.addEventListener('touchstart', () => {
+      if (!isMobile() || !drawerOpen) return;
+      drawerOpen = false;
+      sidebar.classList.remove('drawer-open');
+    }, { passive: true });
   }
 
   // 城市搜索输入框事件绑定
@@ -1353,8 +1699,20 @@
   function openModal(poi) {
     $('#modalName').textContent = poi.name;
     $('#modalTag').textContent = poi.type || poi.category || '-';
-    $('#modalRating').textContent = poi.rating ? `${poi.rating} 分` : '-';
-    $('#modalPrice').textContent = poi.price !== undefined ? (poi.price === 0 ? '免费' : `¥${poi.price}`) : '-';
+    // 评分：区分真实数据和无数据
+    if (poi.rating !== null && poi.rating !== undefined) {
+      $('#modalRating').textContent = `${poi.rating} 分`;
+    } else {
+      $('#modalRating').textContent = '暂无评分';
+    }
+    // 价格：标注数据来源
+    if (poi.price !== undefined && poi.price !== null) {
+      const priceText = poi.price === 0 ? '免费' : `¥${poi.price}`;
+      const sourceTag = poi.priceSource === 'estimated' ? ' (估算)' : '';
+      $('#modalPrice').textContent = priceText + sourceTag;
+    } else {
+      $('#modalPrice').textContent = '-';
+    }
     $('#modalAddress').textContent = poi.address || '-';
 
     const durationRow = $('#modalDurationRow');
@@ -1409,7 +1767,7 @@
       const poiData = await fetchCityPOI(currentCity);
 
       if (poiData.sights.length === 0) {
-        alert(`未能搜索到 ${currentCity} 的景点数据。\n\n可能原因：\n1. API Key 请求量超限（当前使用公用 Demo Key）\n2. 网络连接问题\n\n建议：在 index.html 中替换为您自己申请的腾讯地图 Key`);
+        showToast(`未能搜索到 ${currentCity} 的景点数据。可能是 API 请求量超限或网络问题，请稍后重试`, 'warning', 6000);
         return;
       }
 
@@ -1424,7 +1782,7 @@
       itineraryPanel.classList.add('open');
     } catch (e) {
       console.error('规划失败:', e);
-      alert('规划失败：' + e.message);
+      showToast('规划失败：' + e.message + '。请检查网络连接后重试', 'error', 5000);
     } finally {
       loadingOverlay.style.display = 'none';
       restorePlanBtn();
@@ -1477,14 +1835,21 @@
     }
 
     // ========== 智能路线规划：Supercluster 聚类 + 最近邻 + 2-opt 优化 ==========
-    // 1. 确定每天可游览的景点数
-    const maxSpotsPerDay = (d) => d === 0 ? 3 : 4; // 第一天下午开始，少一些
+    // 1. 确定每天可用时间（分钟）
+    const DAY_START_FIRST = 13 * 60;  // 第一天下午 13:00 开始
+    const DAY_START_NORMAL = 9 * 60;  // 其他天 09:00 开始
+    const DAY_END = 20 * 60;          // 每天 20:00 结束游览
+    const DAY_END_LAST = 18 * 60;     // 最后一天 18:00 结束（预留返程时间）
+    const MAX_DAY_MINUTES = 12 * 60;  // 每天最多游览 12 小时
+
+    // 初步估算每天可容纳的景点数
+    const maxSpotsPerDay = (d) => d === 0 ? 3 : 4;
     let totalSlots = 0;
     for (let d = 0; d < days; d++) totalSlots += maxSpotsPerDay(d);
     const usableSights = sights.slice(0, Math.min(sights.length, totalSlots));
 
-    // 2. K-Means 地理聚类：按实际坐标距离将景点分成 N 天的组
-    const dailySights = clusterSightsByDay(usableSights, days, hotel, arrival);
+    // 2. 地理聚类：按实际坐标距离将景点分成 N 天的组
+    let dailySights = clusterSightsByDay(usableSights, days, hotel, arrival);
 
     // 3. 每天内部用最近邻 + 2-opt 优化排序，确保最短路线
     for (let d = 0; d < dailySights.length; d++) {
@@ -1492,39 +1857,123 @@
       dailySights[d] = sortByNearestNeighbor(dailySights[d], startPoint);
     }
 
-    // 4. 生成行程
+    // 4. 时间校验：检查每天行程是否超时，超时的景点移到下一天
+    for (let d = 0; d < dailySights.length; d++) {
+      const dayStart = d === 0 ? DAY_START_FIRST : DAY_START_NORMAL;
+      const dayEnd = d === days - 1 ? DAY_END_LAST : DAY_END;
+      let currentMinute = dayStart;
+      let prevPoint = d === 0 ? arrival : hotel;
+      const kept = [];
+      const overflow = [];
+
+      for (const sight of dailySights[d]) {
+        const transit = estimateTransitTime(prevPoint.lat, prevPoint.lng, sight.lat, sight.lng);
+        const visitMin = sight.durationMinutes || 120;
+        const needed = transit.minutes + visitMin;
+
+        if (currentMinute + needed <= dayEnd && currentMinute + needed - dayStart <= MAX_DAY_MINUTES) {
+          currentMinute += needed;
+          prevPoint = sight;
+          kept.push(sight);
+        } else {
+          overflow.push(sight);
+        }
+      }
+
+      dailySights[d] = kept;
+      // 将溢出景点追加到下一天
+      if (overflow.length > 0 && d + 1 < dailySights.length) {
+        dailySights[d + 1] = [...overflow, ...dailySights[d + 1]];
+      }
+    }
+
+    // 5. 生成行程（使用真实时间计算）
     const schedule = [];
     let totalTicket = 0;
+    const usedRestaurants = new Set(); // 已使用的餐厅，避免重复推荐
 
     for (let d = 0; d < days; d++) {
       const dayPlan = { day: d + 1, items: [] };
       const daySights = dailySights[d] || [];
+      const isFirstDay = d === 0;
+      const isLastDay = d === days - 1;
 
-      if (d === 0) {
+      let currentMinute = isFirstDay ? 9 * 60 : 9 * 60; // 时间轴从 09:00 开始
+      let prevPoint = isFirstDay ? arrival : hotel;
+
+      if (isFirstDay) {
         dayPlan.items.push({ time: '09:00', name: arrival.name, desc: `抵达${currentCity}，${arrival.type}`, tag: '到达', lat: arrival.lat, lng: arrival.lng });
-        dayPlan.items.push({ time: '10:30', name: hotel.name, desc: `办理入住 · ¥${hotel.price}/晚`, tag: '住宿', lat: hotel.lat, lng: hotel.lng });
+        // 到达后前往酒店
+        const toHotel = estimateTransitTime(arrival.lat, arrival.lng, hotel.lat, hotel.lng);
+        currentMinute = 9 * 60 + toHotel.minutes;
+        dayPlan.items.push({ time: minutesToTime(currentMinute), name: hotel.name, desc: `办理入住 · ≈¥${hotel.price}/晚`, tag: '住宿', lat: hotel.lat, lng: hotel.lng });
+        currentMinute += 90; // 入住+休整 1.5 小时
+        prevPoint = hotel;
       }
 
-      const startHour = d === 0 ? 13 : 9;
+      daySights.forEach((sight) => {
+        // 交通时间
+        const transit = estimateTransitTime(prevPoint.lat, prevPoint.lng, sight.lat, sight.lng);
+        if (transit.minutes > 5) {
+          dayPlan.items.push({
+            time: minutesToTime(currentMinute),
+            name: `🚗 前往${sight.name}`,
+            desc: `${transit.mode} · 约${transit.minutes}分钟 · ${transit.distance.toFixed(1)}km`,
+            tag: '交通'
+          });
+        }
+        currentMinute += transit.minutes;
 
-      daySights.forEach((sight, s) => {
-        const hour = startHour + s * 2;
-        if (hour >= 20) return;
+        // 游览
         totalTicket += (sight.price || 0);
+        const visitMin = sight.durationMinutes || 120;
+        const priceLabel = sight.price === 0 ? '免费' : (sight.priceSource === 'estimated' ? '≈¥' + sight.price : '¥' + sight.price);
         dayPlan.items.push({
-          time: `${String(hour).padStart(2, '0')}:00`,
+          time: minutesToTime(currentMinute),
           name: sight.name,
-          desc: `${sight.type} · ${sight.duration || '2小时'} · ${sight.price === 0 ? '免费' : '¥' + sight.price}`,
+          desc: `${sight.type} · ${sight.duration || '1.5-2.5小时'} · ${priceLabel}`,
           tag: sight.type, lat: sight.lat, lng: sight.lng
         });
+        currentMinute += visitMin;
+        prevPoint = sight;
       });
 
-      dayPlan.items.push({ time: '19:00', name: `${currentCity}特色美食`, desc: `餐饮预算 ≈ ¥${budgetCfg.food}`, tag: '餐饮' });
-
-      if (d < days - 1) {
-        dayPlan.items.push({ time: '21:00', name: hotel.name, desc: '返回酒店休息', tag: '住宿', lat: hotel.lat, lng: hotel.lng });
+      // 晚餐：从餐厅列表中选择距离当天最后一个景点最近的餐厅
+      const dinnerTime = Math.max(currentMinute, 18 * 60 + 30);
+      const restaurants = (poiData.restaurants || []);
+      const nearestRest = findNearestRestaurant(restaurants, prevPoint, usedRestaurants);
+      if (nearestRest) {
+        usedRestaurants.add(nearestRest.name);
+        dayPlan.items.push({
+          time: minutesToTime(dinnerTime),
+          name: nearestRest.name,
+          desc: `🍽️ 人均 ≈¥${nearestRest.price} · ${nearestRest.address || ''}`,
+          tag: '餐饮',
+          lat: nearestRest.lat,
+          lng: nearestRest.lng
+        });
       } else {
-        dayPlan.items.push({ time: '21:00', name: arrival.name, desc: `前往${arrival.type}，结束愉快旅程`, tag: '返程', lat: arrival.lat, lng: arrival.lng });
+        dayPlan.items.push({ time: minutesToTime(dinnerTime), name: `推荐品尝${currentCity}特色美食`, desc: `餐饮预算 ≈ ¥${budgetCfg.food}`, tag: '餐饮' });
+      }
+
+      if (!isLastDay) {
+        dayPlan.items.push({ time: minutesToTime(dinnerTime + 90), name: hotel.name, desc: '返回酒店休息', tag: '住宿', lat: hotel.lat, lng: hotel.lng });
+      } else {
+        // 最后一天：返程
+        const toArrival = estimateTransitTime(prevPoint.lat, prevPoint.lng, arrival.lat, arrival.lng);
+        const departTime = dinnerTime + 60;
+        dayPlan.items.push({
+          time: minutesToTime(departTime),
+          name: `🚗 前往${arrival.name}`,
+          desc: `${toArrival.mode} · 约${toArrival.minutes}分钟，预留充足时间`,
+          tag: '交通'
+        });
+        dayPlan.items.push({
+          time: minutesToTime(departTime + toArrival.minutes),
+          name: arrival.name,
+          desc: `抵达${arrival.type}，结束愉快旅程`,
+          tag: '返程', lat: arrival.lat, lng: arrival.lng
+        });
       }
 
       schedule.push(dayPlan);
@@ -1550,6 +1999,25 @@
       Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
       Math.sin(dLng / 2) * Math.sin(dLng / 2);
     return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  }
+
+  // 基于地理距离估算交通时间（分钟）和交通方式
+  function estimateTransitTime(lat1, lng1, lat2, lng2) {
+    const dist = geoDistance(lat1, lng1, lat2, lng2);
+    if (dist < 1.5) {
+      return { minutes: Math.max(10, Math.round(dist / 4 * 60)), mode: '步行', distance: dist };
+    } else if (dist < 8) {
+      return { minutes: Math.max(15, Math.round(dist / 15 * 60 + 10)), mode: '公交', distance: dist };
+    } else {
+      return { minutes: Math.max(20, Math.round(dist / 30 * 60 + 10)), mode: '打车', distance: dist };
+    }
+  }
+
+  // 将分钟数转为 HH:MM 格式
+  function minutesToTime(totalMinutes) {
+    const h = Math.floor(totalMinutes / 60);
+    const m = Math.round(totalMinutes % 60);
+    return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
   }
 
   // ========== Supercluster 地理聚类：基于 Mapbox 开源的层级贪心聚类算法 ==========
@@ -1864,21 +2332,28 @@
     let globalIdx = 0;
     let html = '';
 
-    data.schedule.forEach(day => {
-      html += `<div class="day-card">
+    data.schedule.forEach((day, dayIdx) => {
+      html += `<div class="day-card" data-day="${dayIdx}">
         <div class="day-header">
           <span class="day-badge">第 ${day.day} 天</span>
         </div>
-        <div class="timeline">`;
+        <div class="timeline" data-day="${dayIdx}">`;
 
-      day.items.forEach(item => {
+      day.items.forEach((item, itemIdx) => {
         const hasCoord = item.lat && item.lng;
+        const isTransit = item.tag === '交通';
+        const isSight = hasCoord && !isTransit && !['到达', '住宿', '返程', '餐饮'].includes(item.tag);
         const dataAttr = hasCoord ? `data-seg-idx="${globalIdx}" data-lat="${item.lat}" data-lng="${item.lng}"` : '';
         const tabIndex = hasCoord ? 'tabindex="0"' : '';
         if (hasCoord) globalIdx++;
 
-        html += `<div class="timeline-item ${hasCoord ? 'clickable' : ''}" ${dataAttr} ${tabIndex} ${hasCoord ? 'role="button"' : ''}>
+        const extraClass = isTransit ? ' transit-item' : '';
+        // 景点项添加删除按钮
+        const deleteBtn = isSight ? `<button class="itinerary-delete-btn" data-day="${dayIdx}" data-item="${itemIdx}" title="移除此景点" aria-label="移除${item.name}">✕</button>` : '';
+
+        html += `<div class="timeline-item ${hasCoord ? 'clickable' : ''}${extraClass}" ${dataAttr} ${tabIndex} ${hasCoord ? 'role="button"' : ''} data-day="${dayIdx}" data-item="${itemIdx}">
           <div class="timeline-dot"></div>
+          ${deleteBtn}
           <div class="timeline-time">${item.time}</div>
           <div class="timeline-name">${item.name}</div>
           <div class="timeline-desc">${item.desc}</div>
@@ -1886,13 +2361,24 @@
         </div>`;
       });
 
-      html += `</div></div>`;
+      // 添加景点按钮
+      html += `</div>
+        <button class="itinerary-add-btn" data-day="${dayIdx}">+ 添加景点</button>
+      </div>`;
     });
+
+    // 一键优化路线按钮
+    html += `<div class="itinerary-actions">
+      <button class="itinerary-optimize-btn" id="optimizeRouteBtn">🔄 一键优化路线</button>
+    </div>`;
 
     panelBody.innerHTML = html;
 
+    // 绑定景点点击事件
     panelBody.querySelectorAll('.timeline-item.clickable').forEach(el => {
-      const handler = () => {
+      const handler = (e) => {
+        // 如果点击的是删除按钮，不触发高亮
+        if (e.target.closest('.itinerary-delete-btn')) return;
         const idx = parseInt(el.dataset.segIdx);
         const lat = parseFloat(el.dataset.lat);
         const lng = parseFloat(el.dataset.lng);
@@ -1900,9 +2386,209 @@
       };
       el.addEventListener('click', handler);
       el.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); handler(); }
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); handler(e); }
       });
     });
+
+    // 绑定删除按钮事件
+    panelBody.querySelectorAll('.itinerary-delete-btn').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const dayIdx = parseInt(btn.dataset.day);
+        const itemIdx = parseInt(btn.dataset.item);
+        removeItineraryItem(dayIdx, itemIdx);
+      });
+    });
+
+    // 绑定添加景点按钮事件
+    panelBody.querySelectorAll('.itinerary-add-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const dayIdx = parseInt(btn.dataset.day);
+        showAddSightPanel(dayIdx);
+      });
+    });
+
+    // 绑定一键优化路线按钮
+    const optimizeBtn = panelBody.querySelector('#optimizeRouteBtn');
+    if (optimizeBtn) {
+      optimizeBtn.addEventListener('click', () => {
+        if (!itineraryData) return;
+        showToast('正在重新优化路线...', 'info', 2000);
+        // 重新规划
+        startPlanning();
+      });
+    }
+
+    // 初始化拖拽排序（SortableJS）
+    if (typeof Sortable !== 'undefined') {
+      panelBody.querySelectorAll('.timeline').forEach(timeline => {
+        new Sortable(timeline, {
+          animation: 200,
+          handle: '.timeline-item:not(.transit-item)',
+          draggable: '.timeline-item:not(.transit-item)',
+          ghostClass: 'sortable-ghost',
+          chosenClass: 'sortable-chosen',
+          onEnd: function (evt) {
+            const dayIdx = parseInt(timeline.dataset.day);
+            if (isNaN(dayIdx) || !itineraryData || !itineraryData.schedule[dayIdx]) return;
+            const day = itineraryData.schedule[dayIdx];
+            // 重新排列 items 数组
+            const oldIdx = evt.oldIndex;
+            const newIdx = evt.newIndex;
+            if (oldIdx === newIdx) return;
+            const movedItem = day.items.splice(oldIdx, 1)[0];
+            day.items.splice(newIdx, 0, movedItem);
+            // 重新渲染
+            renderItinerary(itineraryData);
+            drawRouteSegments(itineraryData);
+            showToast('行程顺序已调整', 'success', 1500);
+          }
+        });
+      });
+    }
+  }
+
+  // ========== 行程编辑功能 ==========
+
+  // 删除行程中的景点项
+  function removeItineraryItem(dayIdx, itemIdx) {
+    if (!itineraryData || !itineraryData.schedule[dayIdx]) return;
+
+    const day = itineraryData.schedule[dayIdx];
+    const item = day.items[itemIdx];
+    if (!item) return;
+
+    // 同时删除该景点前面的交通项（如果有）
+    if (itemIdx > 0 && day.items[itemIdx - 1] && day.items[itemIdx - 1].tag === '交通') {
+      day.items.splice(itemIdx - 1, 2);
+    } else {
+      day.items.splice(itemIdx, 1);
+    }
+
+    // 重新计算费用
+    recalculateCost();
+
+    // 重新渲染
+    renderItinerary(itineraryData);
+    renderCostSummary(itineraryData);
+    drawRouteSegments(itineraryData);
+
+    showToast('已移除景点', 'success', 2000);
+  }
+
+  // 重新计算费用
+  function recalculateCost() {
+    if (!itineraryData) return;
+    const budgetCfg = BUDGET_CONFIG[budget];
+    let totalTicket = 0;
+    itineraryData.schedule.forEach(day => {
+      day.items.forEach(item => {
+        // 从描述中提取门票价格
+        if (item.tag && !['到达', '住宿', '返程', '餐饮', '交通'].includes(item.tag)) {
+          const match = item.desc.match(/[≈¥](\d+)/);
+          if (match) totalTicket += parseInt(match[1]);
+        }
+      });
+    });
+    itineraryData.cost.ticket = totalTicket;
+    itineraryData.cost.food = budgetCfg.food * days;
+    itineraryData.cost.transport = budgetCfg.transport * days;
+  }
+
+  // 显示添加景点面板
+  function showAddSightPanel(dayIdx) {
+    const poiData = poiCache[currentCity];
+    if (!poiData || !poiData.sights) {
+      showToast('暂无可添加的景点数据', 'warning');
+      return;
+    }
+
+    // 获取已在行程中的景点名称
+    const usedNames = new Set();
+    if (itineraryData) {
+      itineraryData.schedule.forEach(day => {
+        day.items.forEach(item => {
+          if (item.lat && item.lng && !['到达', '住宿', '返程', '餐饮', '交通'].includes(item.tag)) {
+            usedNames.add(item.name);
+          }
+        });
+      });
+    }
+
+    // 过滤出未使用的景点
+    const available = poiData.sights.filter(s => !usedNames.has(s.name));
+    if (available.length === 0) {
+      showToast('所有景点已在行程中', 'info');
+      return;
+    }
+
+    // 创建选择弹窗
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.style.display = 'flex';
+    overlay.innerHTML = `<div class="poi-modal" style="max-height:70vh;overflow-y:auto;">
+      <button class="modal-close" aria-label="关闭">✕</button>
+      <div class="modal-header"><h3>添加景点到第 ${dayIdx + 1} 天</h3></div>
+      <div class="modal-body" style="padding:12px 24px 24px;">
+        ${available.map((s, i) => `
+          <div class="add-sight-item" data-idx="${i}" style="display:flex;align-items:center;justify-content:space-between;padding:12px;border-bottom:1px solid #f1f5f9;cursor:pointer;border-radius:8px;transition:background .15s;">
+            <div>
+              <div style="font-weight:600;font-size:14px;">${s.name}</div>
+              <div style="font-size:12px;color:#64748b;">${s.type} · ${s.duration || '1.5-2.5小时'} · ${s.price === 0 ? '免费' : '≈¥' + s.price}</div>
+            </div>
+            <span style="color:#2563eb;font-size:20px;font-weight:700;">+</span>
+          </div>
+        `).join('')}
+      </div>
+    </div>`;
+
+    document.body.appendChild(overlay);
+
+    // 关闭
+    overlay.querySelector('.modal-close').addEventListener('click', () => overlay.remove());
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+
+    // 选择景点
+    overlay.querySelectorAll('.add-sight-item').forEach(el => {
+      el.addEventListener('mouseenter', () => el.style.background = '#eff6ff');
+      el.addEventListener('mouseleave', () => el.style.background = '');
+      el.addEventListener('click', () => {
+        const idx = parseInt(el.dataset.idx);
+        const sight = available[idx];
+        addSightToDay(dayIdx, sight);
+        overlay.remove();
+      });
+    });
+  }
+
+  // 将景点添加到指定天的行程中
+  function addSightToDay(dayIdx, sight) {
+    if (!itineraryData || !itineraryData.schedule[dayIdx]) return;
+
+    const day = itineraryData.schedule[dayIdx];
+    // 在餐饮项之前插入
+    let insertIdx = day.items.length - 2; // 餐饮和住宿/返程之前
+    if (insertIdx < 0) insertIdx = day.items.length;
+
+    const priceLabel = sight.price === 0 ? '免费' : (sight.priceSource === 'estimated' ? '≈¥' + sight.price : '¥' + sight.price);
+    const newItem = {
+      time: '--:--',
+      name: sight.name,
+      desc: `${sight.type} · ${sight.duration || '1.5-2.5小时'} · ${priceLabel}`,
+      tag: sight.type,
+      lat: sight.lat,
+      lng: sight.lng
+    };
+
+    day.items.splice(insertIdx, 0, newItem);
+
+    // 重新计算费用和渲染
+    recalculateCost();
+    renderItinerary(itineraryData);
+    renderCostSummary(itineraryData);
+    drawRouteSegments(itineraryData);
+
+    showToast(`已添加「${sight.name}」到第 ${dayIdx + 1} 天`, 'success', 2000);
   }
 
   // ========== 路线分段绘制 ==========
@@ -1991,13 +2677,16 @@
 
   function renderCostSummary(data) {
     const c = data.cost;
-    $('#costHotel').textContent = `¥${c.hotel.toLocaleString()}`;
-    $('#costFood').textContent = `¥${c.food.toLocaleString()}`;
-    $('#costTransport').textContent = `¥${c.transport.toLocaleString()}`;
-    $('#costTicket').textContent = `¥${c.ticket.toLocaleString()}`;
+    $('#costHotel').textContent = `≈¥${c.hotel.toLocaleString()}`;
+    $('#costFood').textContent = `≈¥${c.food.toLocaleString()}`;
+    $('#costTransport').textContent = `≈¥${c.transport.toLocaleString()}`;
+    $('#costTicket').textContent = `≈¥${c.ticket.toLocaleString()}`;
     const total = c.hotel + c.food + c.transport + c.ticket;
-    $('#costTotal').textContent = `¥${total.toLocaleString()}`;
+    $('#costTotal').textContent = `≈¥${total.toLocaleString()}`;
     costSummary.style.display = 'block';
+    // 显示免责声明
+    const disclaimer = $('#costDisclaimer');
+    if (disclaimer) disclaimer.style.display = 'block';
   }
 
   function hideCostSummary() {
@@ -2014,6 +2703,288 @@
     clearRouteSegments();
     hideCostSummary();
     itineraryData = null;
+  }
+
+  // ========== 行程保存与分享 ==========
+  const ITINERARY_SAVE_KEY = 'travel_saved_itinerary';
+
+  function saveItinerary() {
+    if (!itineraryData) {
+      showToast('暂无行程可保存', 'warning');
+      return;
+    }
+    try {
+      const saveData = {
+        city: currentCity,
+        days: days,
+        budget: budget,
+        itinerary: itineraryData,
+        savedAt: Date.now()
+      };
+      localStorage.setItem(ITINERARY_SAVE_KEY, JSON.stringify(saveData));
+      showToast('行程已保存，下次访问可恢复', 'success');
+    } catch (e) {
+      showToast('保存失败：' + e.message, 'error');
+    }
+  }
+
+  function loadSavedItinerary() {
+    try {
+      const raw = localStorage.getItem(ITINERARY_SAVE_KEY);
+      if (!raw) return null;
+      const data = JSON.parse(raw);
+      // 检查是否过期（7天）
+      if (Date.now() - data.savedAt > 7 * 24 * 60 * 60 * 1000) {
+        localStorage.removeItem(ITINERARY_SAVE_KEY);
+        return null;
+      }
+      return data;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function promptRestoreItinerary() {
+    const saved = loadSavedItinerary();
+    if (!saved) return;
+
+    const restoreBar = document.createElement('div');
+    restoreBar.style.cssText = 'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#fff;border:1.5px solid #2563eb;border-radius:12px;padding:12px 20px;box-shadow:0 8px 32px rgba(0,0,0,.12);z-index:40000;display:flex;align-items:center;gap:12px;font-size:14px;';
+    restoreBar.innerHTML = `
+      <span>📋 发现上次保存的 <strong>${saved.city}</strong> ${saved.days}天行程</span>
+      <button id="restoreYes" style="padding:6px 16px;background:#2563eb;color:#fff;border:none;border-radius:6px;font-weight:600;cursor:pointer;">恢复</button>
+      <button id="restoreNo" style="padding:6px 16px;background:#f1f5f9;color:#64748b;border:none;border-radius:6px;font-weight:600;cursor:pointer;">忽略</button>
+    `;
+    document.body.appendChild(restoreBar);
+
+    restoreBar.querySelector('#restoreYes').addEventListener('click', () => {
+      currentCity = saved.city;
+      days = saved.days;
+      budget = saved.budget;
+      daysValue.textContent = days;
+      budgetTabs.forEach(t => {
+        t.classList.toggle('active', t.dataset.budget === budget);
+      });
+      updateBudgetDetail();
+
+      itineraryData = saved.itinerary;
+      renderItinerary(itineraryData);
+      renderCostSummary(itineraryData);
+      drawRouteSegments(itineraryData);
+      itineraryPanel.style.display = 'flex';
+      itineraryPanel.classList.add('open');
+
+      restoreBar.remove();
+      showToast('行程已恢复', 'success');
+    });
+
+    restoreBar.querySelector('#restoreNo').addEventListener('click', () => {
+      restoreBar.remove();
+    });
+
+    // 10 秒后自动消失
+    setTimeout(() => { if (restoreBar.parentNode) restoreBar.remove(); }, 10000);
+  }
+
+  // URL 分享功能
+  function shareItinerary() {
+    if (!itineraryData) {
+      showToast('暂无行程可分享', 'warning');
+      return;
+    }
+    try {
+      const shareData = {
+        c: currentCity,
+        d: days,
+        b: budget,
+        // 只保存核心数据，减小 URL 长度
+        s: itineraryData.schedule.map(day => ({
+          day: day.day,
+          items: day.items.map(item => ({
+            t: item.time, n: item.name, d: item.desc, g: item.tag,
+            ...(item.lat ? { la: item.lat, ln: item.lng } : {})
+          }))
+        }))
+      };
+      const encoded = btoa(encodeURIComponent(JSON.stringify(shareData)));
+      const url = window.location.origin + window.location.pathname + '?plan=' + encoded;
+
+      if (navigator.clipboard) {
+        navigator.clipboard.writeText(url).then(() => {
+          showToast('分享链接已复制到剪贴板', 'success');
+        });
+      } else {
+        // 降级方案
+        const input = document.createElement('input');
+        input.value = url;
+        document.body.appendChild(input);
+        input.select();
+        document.execCommand('copy');
+        input.remove();
+        showToast('分享链接已复制到剪贴板', 'success');
+      }
+    } catch (e) {
+      showToast('生成分享链接失败：' + e.message, 'error');
+    }
+  }
+
+  // 从 URL 参数恢复行程
+  function restoreFromUrl() {
+    const params = new URLSearchParams(window.location.search);
+    const planData = params.get('plan');
+    if (!planData) return false;
+
+    try {
+      const decoded = JSON.parse(decodeURIComponent(atob(planData)));
+      currentCity = decoded.c;
+      days = decoded.d;
+      budget = decoded.b;
+      daysValue.textContent = days;
+      budgetTabs.forEach(t => {
+        t.classList.toggle('active', t.dataset.budget === budget);
+      });
+      updateBudgetDetail();
+
+      itineraryData = {
+        schedule: decoded.s.map(day => ({
+          day: day.day,
+          items: day.items.map(item => ({
+            time: item.t, name: item.n, desc: item.d, tag: item.g,
+            ...(item.la ? { lat: item.la, lng: item.ln } : {})
+          }))
+        })),
+        cost: { hotel: 0, food: 0, transport: 0, ticket: 0 }
+      };
+      recalculateCost();
+
+      setTimeout(() => {
+        renderItinerary(itineraryData);
+        renderCostSummary(itineraryData);
+        drawRouteSegments(itineraryData);
+        itineraryPanel.style.display = 'flex';
+        itineraryPanel.classList.add('open');
+        showToast('已从分享链接恢复行程', 'success');
+      }, 1500);
+
+      // 清除 URL 参数
+      window.history.replaceState({}, '', window.location.pathname);
+      return true;
+    } catch (e) {
+      console.warn('URL 行程恢复失败:', e);
+      return false;
+    }
+  }
+
+  // PDF 导出
+  function exportPdf() {
+    if (!itineraryData) {
+      showToast('暂无行程可导出', 'warning');
+      return;
+    }
+    showToast('正在准备打印...', 'info', 2000);
+    setTimeout(() => window.print(), 500);
+  }
+
+  // ========== 新手引导 ==========
+  const ONBOARDING_KEY = 'travel_onboarding_done';
+
+  function showOnboarding() {
+    // 已完成引导则跳过
+    if (localStorage.getItem(ONBOARDING_KEY)) return;
+
+    const steps = [
+      { target: '#citySelect', title: '① 选择目的地', desc: '从热门城市中选择，或搜索任意地点', position: 'right' },
+      { target: '#daysValue', title: '② 设置天数与预算', desc: '调整行程天数和预算档位', position: 'right' },
+      { target: '#planBtn', title: '③ 开始规划', desc: '点击按钮，AI 智能生成专属行程', position: 'right' },
+      { target: '#mapContainer', title: '④ 查看地图与行程', desc: '在地图上查看景点分布，右侧面板查看详细行程', position: 'center' }
+    ];
+
+    let currentStep = 0;
+
+    // 创建遮罩层
+    const overlay = document.createElement('div');
+    overlay.className = 'onboarding-overlay';
+    overlay.innerHTML = `
+      <div class="onboarding-card" id="onboardingCard">
+        <div class="onboarding-step-indicator" id="onboardingIndicator"></div>
+        <h3 class="onboarding-title" id="onboardingTitle"></h3>
+        <p class="onboarding-desc" id="onboardingDesc"></p>
+        <div class="onboarding-actions">
+          <button class="onboarding-skip" id="onboardingSkip">跳过</button>
+          <button class="onboarding-next" id="onboardingNext">下一步</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+
+    function renderStep() {
+      const step = steps[currentStep];
+      const card = document.getElementById('onboardingCard');
+      const indicator = document.getElementById('onboardingIndicator');
+      const title = document.getElementById('onboardingTitle');
+      const desc = document.getElementById('onboardingDesc');
+      const nextBtn = document.getElementById('onboardingNext');
+
+      // 步骤指示器
+      indicator.innerHTML = steps.map((_, i) =>
+        `<span class="onboarding-dot${i === currentStep ? ' active' : ''}"></span>`
+      ).join('');
+
+      title.textContent = step.title;
+      desc.textContent = step.desc;
+      nextBtn.textContent = currentStep === steps.length - 1 ? '开始使用 🚀' : '下一步';
+
+      // 高亮目标元素
+      const targetEl = document.querySelector(step.target);
+      if (targetEl && step.position !== 'center') {
+        const rect = targetEl.getBoundingClientRect();
+        card.style.position = 'fixed';
+        card.style.top = Math.min(rect.top, window.innerHeight - 200) + 'px';
+        card.style.left = (rect.right + 16) + 'px';
+        card.style.transform = 'none';
+        targetEl.style.position = 'relative';
+        targetEl.style.zIndex = '60001';
+        targetEl.style.boxShadow = '0 0 0 4px rgba(37,99,235,.4), 0 0 20px rgba(37,99,235,.2)';
+        targetEl.style.borderRadius = '8px';
+      } else {
+        card.style.position = 'fixed';
+        card.style.top = '50%';
+        card.style.left = '50%';
+        card.style.transform = 'translate(-50%, -50%)';
+      }
+    }
+
+    function clearHighlights() {
+      steps.forEach(step => {
+        const el = document.querySelector(step.target);
+        if (el) {
+          el.style.zIndex = '';
+          el.style.boxShadow = '';
+          el.style.borderRadius = '';
+          el.style.position = '';
+        }
+      });
+    }
+
+    function finish() {
+      clearHighlights();
+      overlay.classList.add('onboarding-fade-out');
+      setTimeout(() => { if (overlay.parentNode) overlay.remove(); }, 300);
+      localStorage.setItem(ONBOARDING_KEY, '1');
+    }
+
+    document.getElementById('onboardingSkip').addEventListener('click', finish);
+    document.getElementById('onboardingNext').addEventListener('click', () => {
+      clearHighlights();
+      currentStep++;
+      if (currentStep >= steps.length) {
+        finish();
+      } else {
+        renderStep();
+      }
+    });
+
+    renderStep();
   }
 
   document.addEventListener('DOMContentLoaded', init);
