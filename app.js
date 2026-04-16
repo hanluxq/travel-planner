@@ -2409,6 +2409,78 @@
       }
     }
 
+    // 第五步：近邻吸引 — 确保地理上相近的景点在同一天
+    // 策略：检测每个景点是否是当天的"孤立点"（离当天其他景点都很远），
+    // 如果它和其他天的某个景点距离很近，则移过去
+    let swapRounds = 15;
+    let swapped = true;
+    while (swapped && swapRounds-- > 0) {
+      swapped = false;
+
+      for (let d = 0; d < numDays && !swapped; d++) {
+        for (let i = 0; i < dailySights[d].length && !swapped; i++) {
+          const s = dailySights[d][i];
+
+          // 计算 s 到当天其他景点的最小距离
+          let minDistSameDay = Infinity;
+          for (let k = 0; k < dailySights[d].length; k++) {
+            if (k === i) continue;
+            const dist = geoDistance(s.lat, s.lng, dailySights[d][k].lat, dailySights[d][k].lng);
+            if (dist < minDistSameDay) minDistSameDay = dist;
+          }
+          // 如果当天只有一个景点，不算孤立
+          if (dailySights[d].length <= 1) continue;
+
+          // 检查其他天是否有更近的景点
+          for (let d2 = 0; d2 < numDays && !swapped; d2++) {
+            if (d2 === d) continue;
+            if (dailySights[d2].length === 0) continue;
+
+            // 找到 d2 中离 s 最近的景点
+            let minDistOtherDay = Infinity;
+            for (const s2 of dailySights[d2]) {
+              const dist = geoDistance(s.lat, s.lng, s2.lat, s2.lng);
+              if (dist < minDistOtherDay) minDistOtherDay = dist;
+            }
+
+            // 如果 s 离其他天的景点更近，且差距显著（至少近 30%），尝试移动
+            if (minDistOtherDay < minDistSameDay * 0.7 && minDistOtherDay < 20) {
+              // 检查容量：目标天有空位
+              if (dailySights[d2].length < maxPerDay(d2)) {
+                dailySights[d].splice(i, 1);
+                dailySights[d2].push(s);
+                swapped = true;
+                break;
+              }
+
+              // 容量满了，尝试交换：找 d2 中离 d 质心最近的景点交换
+              const c_d = clusterCentroid(dailySights[d]);
+              let bestSwapIdx = -1;
+              let bestSwapBenefit = 0;
+              for (let j = 0; j < dailySights[d2].length; j++) {
+                const s2 = dailySights[d2][j];
+                const s2_to_cd = geoDistance(s2.lat, s2.lng, c_d.lat, c_d.lng);
+                const s_to_cd = geoDistance(s.lat, s.lng, c_d.lat, c_d.lng);
+                // 交换收益 = s 移到 d2 的收益 + s2 移到 d 的收益
+                const benefit = (minDistSameDay - minDistOtherDay) + (s_to_cd - s2_to_cd);
+                if (benefit > bestSwapBenefit) {
+                  bestSwapBenefit = benefit;
+                  bestSwapIdx = j;
+                }
+              }
+              if (bestSwapIdx >= 0 && bestSwapBenefit > 5) { // 至少 5km 的收益
+                const temp = dailySights[d2][bestSwapIdx];
+                dailySights[d2][bestSwapIdx] = s;
+                dailySights[d][i] = temp;
+                swapped = true;
+                break;
+              }
+            }
+          }
+        }
+      }
+    }
+
     return dailySights;
   }
 
