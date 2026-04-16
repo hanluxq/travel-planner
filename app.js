@@ -1801,38 +1801,9 @@
     const budgetCfg = BUDGET_CONFIG[budget];
     const arrival = cityInfo.arrivals[arrivalSelect.value || 0];
 
-    // 根据预算选酒店：确保不同档位选到不同酒店
-    let hotel;
-    if (hotels.length > 0) {
-      // 按价格排序的副本，用于 fallback
-      const sortedByPrice = [...hotels].sort((a, b) => a.price - b.price);
-      const sortedByPriceDesc = [...hotels].sort((a, b) => b.price - a.price);
-
-      if (budget === '舒适') {
-        // 舒适档：优先选 ≥800 的最贵酒店，否则选整体最贵的
-        const luxury = hotels.filter(h => h.price >= 800).sort((a, b) => b.price - a.price);
-        hotel = luxury[0] || sortedByPriceDesc[0];
-      } else if (budget === '标准') {
-        // 标准档：优先选 300-700 区间评分最高的，否则选价格最接近中位数的
-        const mid = hotels.filter(h => h.price >= 300 && h.price <= 700).sort((a, b) => b.rating - a.rating);
-        if (mid.length > 0) {
-          hotel = mid[0];
-        } else {
-          // 没有 300-700 区间的，选价格最接近 500 的
-          const target = 500;
-          hotel = [...hotels].sort((a, b) => Math.abs(a.price - target) - Math.abs(b.price - target))[0];
-        }
-      } else {
-        // 经济档：优先选 ≤300 的最便宜酒店，否则选整体最便宜的
-        const cheap = hotels.filter(h => h.price <= 300).sort((a, b) => a.price - b.price);
-        hotel = cheap[0] || sortedByPrice[0];
-      }
-
-      // 最终保底：确保不同档位尽量选不同酒店
-      if (!hotel) hotel = hotels[0];
-    } else {
-      hotel = hotels[0];
-    }
+    // 用于聚类阶段的临时酒店（取候选列表第一个，仅作为聚类参考点）
+    const hotelCandidates = filterHotelsByBudget(hotels, budget);
+    const tempHotel = hotelCandidates[0] || hotels[0] || { lat: arrival.lat, lng: arrival.lng, price: 0, name: '默认住宿' };
 
     // ========== 智能路线规划：Supercluster 聚类 + 最近邻 + 2-opt 优化 ==========
     // 1. 确定每天可用时间（分钟）
@@ -1849,11 +1820,15 @@
     const usableSights = sights.slice(0, Math.min(sights.length, totalSlots));
 
     // 2. 地理聚类：按实际坐标距离将景点分成 N 天的组
-    let dailySights = clusterSightsByDay(usableSights, days, hotel, arrival);
+    let dailySights = clusterSightsByDay(usableSights, days, tempHotel, arrival);
+
+    // 2.5 为每天独立选择酒店（基于景点聚类质心）
+    const dailyHotels = selectDailyHotels(dailySights, hotels, budget, days);
 
     // 3. 每天内部用最近邻 + 2-opt 优化排序，确保最短路线
     for (let d = 0; d < dailySights.length; d++) {
-      const startPoint = d === 0 ? arrival : hotel;
+      const dayHotel = dailyHotels[d] || tempHotel;
+      const startPoint = d === 0 ? arrival : dayHotel;
       dailySights[d] = sortByNearestNeighbor(dailySights[d], startPoint);
     }
 
@@ -1862,7 +1837,8 @@
       const dayStart = d === 0 ? DAY_START_FIRST : DAY_START_NORMAL;
       const dayEnd = d === days - 1 ? DAY_END_LAST : DAY_END;
       let currentMinute = dayStart;
-      let prevPoint = d === 0 ? arrival : hotel;
+      const dayHotel = dailyHotels[d] || tempHotel;
+      let prevPoint = d === 0 ? arrival : dayHotel;
       const kept = [];
       const overflow = [];
 
@@ -1897,18 +1873,43 @@
       const daySights = dailySights[d] || [];
       const isFirstDay = d === 0;
       const isLastDay = d === days - 1;
+      const todayHotel = dailyHotels[d]; // 当天酒店（最后一天为 null）
+      const prevDayHotel = d > 0 ? dailyHotels[d - 1] : null;
 
-      let currentMinute = isFirstDay ? 9 * 60 : 9 * 60; // 时间轴从 09:00 开始
-      let prevPoint = isFirstDay ? arrival : hotel;
+      let currentMinute = 9 * 60; // 时间轴从 09:00 开始
+      let prevPoint = isFirstDay ? arrival : (prevDayHotel || tempHotel);
 
       if (isFirstDay) {
         dayPlan.items.push({ time: '09:00', name: arrival.name, desc: `抵达${currentCity}，${arrival.type}`, tag: '到达', lat: arrival.lat, lng: arrival.lng });
-        // 到达后前往酒店
-        const toHotel = estimateTransitTime(arrival.lat, arrival.lng, hotel.lat, hotel.lng);
-        currentMinute = 9 * 60 + toHotel.minutes;
-        dayPlan.items.push({ time: minutesToTime(currentMinute), name: hotel.name, desc: `办理入住 · ≈¥${hotel.price}/晚`, tag: '住宿', lat: hotel.lat, lng: hotel.lng });
-        currentMinute += 90; // 入住+休整 1.5 小时
-        prevPoint = hotel;
+        // 到达后前往当天酒店
+        if (todayHotel) {
+          const toHotel = estimateTransitTime(arrival.lat, arrival.lng, todayHotel.lat, todayHotel.lng);
+          currentMinute = 9 * 60 + toHotel.minutes;
+          dayPlan.items.push({ time: minutesToTime(currentMinute), name: todayHotel.name, desc: `办理入住 · ≈¥${todayHotel.price}/晚`, tag: '住宿', lat: todayHotel.lat, lng: todayHotel.lng });
+          currentMinute += 90; // 入住+休整 1.5 小时
+          prevPoint = todayHotel;
+        }
+      } else if (!isLastDay && todayHotel && prevDayHotel) {
+        // 非首日非末日：检查是否需要换酒店
+        const isSameHotel = todayHotel.name === prevDayHotel.name && todayHotel.lat === prevDayHotel.lat;
+        if (!isSameHotel) {
+          // 需要换酒店：退房 → 前往新酒店 → 寄存行李
+          dayPlan.items.push({ time: minutesToTime(currentMinute), name: prevDayHotel.name, desc: '退房，携带行李出发', tag: '住宿', lat: prevDayHotel.lat, lng: prevDayHotel.lng });
+          currentMinute += 30; // 退房 30 分钟
+          const toNewHotel = estimateTransitTime(prevDayHotel.lat, prevDayHotel.lng, todayHotel.lat, todayHotel.lng);
+          if (toNewHotel.minutes > 5) {
+            dayPlan.items.push({
+              time: minutesToTime(currentMinute),
+              name: `🚗 前往${todayHotel.name}`,
+              desc: `${toNewHotel.mode} · 约${toNewHotel.minutes}分钟 · ${toNewHotel.distance.toFixed(1)}km`,
+              tag: '交通'
+            });
+          }
+          currentMinute += toNewHotel.minutes;
+          dayPlan.items.push({ time: minutesToTime(currentMinute), name: todayHotel.name, desc: `寄存行李 · ≈¥${todayHotel.price}/晚`, tag: '住宿', lat: todayHotel.lat, lng: todayHotel.lng });
+          currentMinute += 20; // 寄存行李 20 分钟
+          prevPoint = todayHotel;
+        }
       }
 
       daySights.forEach((sight) => {
@@ -1956,9 +1957,9 @@
         dayPlan.items.push({ time: minutesToTime(dinnerTime), name: `推荐品尝${currentCity}特色美食`, desc: `餐饮预算 ≈ ¥${budgetCfg.food}`, tag: '餐饮' });
       }
 
-      if (!isLastDay) {
-        dayPlan.items.push({ time: minutesToTime(dinnerTime + 90), name: hotel.name, desc: '返回酒店休息', tag: '住宿', lat: hotel.lat, lng: hotel.lng });
-      } else {
+      if (!isLastDay && todayHotel) {
+        dayPlan.items.push({ time: minutesToTime(dinnerTime + 90), name: todayHotel.name, desc: '返回酒店休息', tag: '住宿', lat: todayHotel.lat, lng: todayHotel.lng });
+      } else if (isLastDay) {
         // 最后一天：返程
         const toArrival = estimateTransitTime(prevPoint.lat, prevPoint.lng, arrival.lat, arrival.lng);
         const departTime = dinnerTime + 60;
@@ -1979,15 +1980,109 @@
       schedule.push(dayPlan);
     }
 
+    // 累加每天酒店价格
+    let totalHotelCost = 0;
+    for (const h of dailyHotels) {
+      if (h) totalHotelCost += h.price;
+    }
+    // 至少保证 1 晚的费用（单日行程特殊处理）
+    if (totalHotelCost === 0 && days === 1 && tempHotel) {
+      totalHotelCost = 0; // 单日行程不住宿，费用为 0
+    }
+
     return {
-      schedule, hotel,
+      schedule, dailyHotels,
       cost: {
-        hotel: hotel.price * Math.max(days - 1, 1),
+        hotel: totalHotelCost,
         food: budgetCfg.food * days,
         transport: budgetCfg.transport * days,
         ticket: totalTicket
       }
     };
+  }
+
+  // ========== 按预算筛选酒店候选列表 ==========
+  function filterHotelsByBudget(hotels, budgetLevel) {
+    if (!hotels || hotels.length === 0) return [];
+    const sortedByPrice = [...hotels].sort((a, b) => a.price - b.price);
+    const sortedByPriceDesc = [...hotels].sort((a, b) => b.price - a.price);
+
+    let candidates = [];
+    if (budgetLevel === '舒适') {
+      // 舒适档：优先选 ≥800 的酒店，按价格降序
+      candidates = hotels.filter(h => h.price >= 800).sort((a, b) => b.price - a.price);
+      if (candidates.length === 0) candidates = sortedByPriceDesc;
+    } else if (budgetLevel === '标准') {
+      // 标准档：优先选 300-700 区间，按评分降序
+      candidates = hotels.filter(h => h.price >= 300 && h.price <= 700).sort((a, b) => b.rating - a.rating);
+      if (candidates.length === 0) {
+        // 没有 300-700 区间的，按距离 500 的偏差排序
+        candidates = [...hotels].sort((a, b) => Math.abs(a.price - 500) - Math.abs(b.price - 500));
+      }
+    } else {
+      // 经济档：优先选 ≤300 的酒店，按价格升序
+      candidates = hotels.filter(h => h.price <= 300).sort((a, b) => a.price - b.price);
+      if (candidates.length === 0) candidates = sortedByPrice;
+    }
+    return candidates;
+  }
+
+  // ========== 计算景点地理质心 ==========
+  function computeCentroid(sights) {
+    if (!sights || sights.length === 0) return null;
+    let sumLat = 0, sumLng = 0;
+    for (const s of sights) {
+      sumLat += s.lat;
+      sumLng += s.lng;
+    }
+    return { lat: sumLat / sights.length, lng: sumLng / sights.length };
+  }
+
+  // ========== 从候选酒店中选择距离质心最近的酒店 ==========
+  function selectNearestHotel(candidates, centroid) {
+    if (!candidates || candidates.length === 0 || !centroid) return null;
+    let best = candidates[0];
+    let bestDist = geoDistance(centroid.lat, centroid.lng, best.lat, best.lng);
+    for (let i = 1; i < candidates.length; i++) {
+      const d = geoDistance(centroid.lat, centroid.lng, candidates[i].lat, candidates[i].lng);
+      if (d < bestDist) {
+        bestDist = d;
+        best = candidates[i];
+      }
+    }
+    return best;
+  }
+
+  // ========== 为每天独立选择酒店 ==========
+  function selectDailyHotels(dailySights, hotels, budgetLevel, numDays) {
+    const candidates = filterHotelsByBudget(hotels, budgetLevel);
+    const allHotelsFallback = [...hotels].sort((a, b) => a.price - b.price);
+    const dailyHotels = [];
+
+    for (let d = 0; d < numDays; d++) {
+      // 最后一天不住宿
+      if (d === numDays - 1) {
+        dailyHotels.push(null);
+        continue;
+      }
+
+      const daySights = dailySights[d] || [];
+      if (daySights.length === 0) {
+        // 当天无景点，使用候选列表第一个酒店
+        dailyHotels.push(candidates[0] || allHotelsFallback[0] || null);
+        continue;
+      }
+
+      const centroid = computeCentroid(daySights);
+      let hotel = selectNearestHotel(candidates, centroid);
+      // 降级方案：如果候选列表为空，从全部酒店中选最近的
+      if (!hotel) {
+        hotel = selectNearestHotel(allHotelsFallback, centroid);
+      }
+      dailyHotels.push(hotel);
+    }
+
+    return dailyHotels;
   }
 
   // ========== 地理距离计算（Haversine 公式） ==========
@@ -2481,6 +2576,7 @@
     if (!itineraryData) return;
     const budgetCfg = BUDGET_CONFIG[budget];
     let totalTicket = 0;
+    let totalHotel = 0;
     itineraryData.schedule.forEach(day => {
       day.items.forEach(item => {
         // 从描述中提取门票价格
@@ -2488,9 +2584,15 @@
           const match = item.desc.match(/[≈¥](\d+)/);
           if (match) totalTicket += parseInt(match[1]);
         }
+        // 从住宿项中提取酒店价格（匹配"办理入住"或"寄存行李"描述中的价格）
+        if (item.tag === '住宿' && item.desc) {
+          const hotelMatch = item.desc.match(/≈¥(\d+)\/晚/);
+          if (hotelMatch) totalHotel += parseInt(hotelMatch[1]);
+        }
       });
     });
     itineraryData.cost.ticket = totalTicket;
+    itineraryData.cost.hotel = totalHotel;
     itineraryData.cost.food = budgetCfg.food * days;
     itineraryData.cost.transport = budgetCfg.transport * days;
   }
