@@ -3040,9 +3040,18 @@
       const targetEl = document.querySelector(step.target);
       if (targetEl && step.position !== 'center') {
         const rect = targetEl.getBoundingClientRect();
+        const cardWidth = 320; // 与 CSS 中 .onboarding-card width 一致
+        const sidebar = document.querySelector('.sidebar');
+        const sidebarRight = sidebar ? sidebar.getBoundingClientRect().right : 0;
+        // 弹窗左边缘至少在 sidebar 右侧 + 16px
+        let cardLeft = Math.max(rect.right + 16, sidebarRight + 16);
+        // 如果弹窗超出屏幕右边界，改为屏幕居中显示
+        if (cardLeft + cardWidth > window.innerWidth - 16) {
+          cardLeft = Math.max(sidebarRight + 16, (window.innerWidth - cardWidth) / 2);
+        }
         card.style.position = 'fixed';
         card.style.top = Math.min(rect.top, window.innerHeight - 200) + 'px';
-        card.style.left = (rect.right + 16) + 'px';
+        card.style.left = cardLeft + 'px';
         card.style.transform = 'none';
         targetEl.style.position = 'relative';
         targetEl.style.zIndex = '60001';
