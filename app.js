@@ -2460,9 +2460,10 @@
       </div>`;
     });
 
-    // 一键优化路线按钮
+    // 底部操作区：随机规划 + 智能优化
     html += `<div class="itinerary-actions">
-      <button class="itinerary-optimize-btn" id="optimizeRouteBtn">🔄 一键优化路线</button>
+      <button class="itinerary-action-btn itinerary-random-btn" id="randomPlanBtn" title="重新随机获取景点并规划">🎲 随机规划</button>
+      <button class="itinerary-action-btn itinerary-smart-btn" id="smartOptimizeBtn" title="对当前景点按最短路线重新排序">🧠 智能优化路线</button>
     </div>`;
 
     panelBody.innerHTML = html;
@@ -2501,14 +2502,22 @@
       });
     });
 
-    // 绑定一键优化路线按钮
-    const optimizeBtn = panelBody.querySelector('#optimizeRouteBtn');
-    if (optimizeBtn) {
-      optimizeBtn.addEventListener('click', () => {
+    // 绑定随机规划按钮（重新获取景点并规划）
+    const randomBtn = panelBody.querySelector('#randomPlanBtn');
+    if (randomBtn) {
+      randomBtn.addEventListener('click', () => {
         if (!itineraryData) return;
-        showToast('正在重新优化路线...', 'info', 2000);
-        // 重新规划
+        showToast('正在重新随机规划...', 'info', 2000);
         startPlanning();
+      });
+    }
+
+    // 绑定智能优化路线按钮（对当前景点重新聚类排序）
+    const smartBtn = panelBody.querySelector('#smartOptimizeBtn');
+    if (smartBtn) {
+      smartBtn.addEventListener('click', () => {
+        if (!itineraryData) return;
+        optimizeCurrentItinerary();
       });
     }
 
@@ -2626,35 +2635,64 @@
     const overlay = document.createElement('div');
     overlay.className = 'modal-overlay';
     overlay.style.display = 'flex';
-    overlay.innerHTML = `<div class="poi-modal" style="max-height:70vh;overflow-y:auto;">
+
+    const renderSightList = (sights) => sights.map((s, i) => `
+      <div class="add-sight-item" data-name="${s.name}" data-idx="${i}" style="display:flex;align-items:center;justify-content:space-between;padding:12px;border-bottom:1px solid #f1f5f9;cursor:pointer;border-radius:8px;transition:background .15s;">
+        <div>
+          <div style="font-weight:600;font-size:14px;">${s.name}</div>
+          <div style="font-size:12px;color:#64748b;">${s.type} · ${s.duration || '1.5-2.5小时'} · ${s.price === 0 ? '免费' : '≈¥' + s.price}</div>
+        </div>
+        <span style="color:#2563eb;font-size:20px;font-weight:700;">+</span>
+      </div>
+    `).join('');
+
+    overlay.innerHTML = `<div class="poi-modal" style="max-height:75vh;overflow:hidden;display:flex;flex-direction:column;">
       <button class="modal-close" aria-label="关闭">✕</button>
       <div class="modal-header"><h3>添加景点到第 ${dayIdx + 1} 天</h3></div>
-      <div class="modal-body" style="padding:12px 24px 24px;">
-        ${available.map((s, i) => `
-          <div class="add-sight-item" data-idx="${i}" style="display:flex;align-items:center;justify-content:space-between;padding:12px;border-bottom:1px solid #f1f5f9;cursor:pointer;border-radius:8px;transition:background .15s;">
-            <div>
-              <div style="font-weight:600;font-size:14px;">${s.name}</div>
-              <div style="font-size:12px;color:#64748b;">${s.type} · ${s.duration || '1.5-2.5小时'} · ${s.price === 0 ? '免费' : '≈¥' + s.price}</div>
-            </div>
-            <span style="color:#2563eb;font-size:20px;font-weight:700;">+</span>
-          </div>
-        `).join('')}
+      <div style="padding:8px 24px 0;">
+        <input type="text" id="sightSearchInput" placeholder="🔍 搜索景点名称..." style="width:100%;padding:10px 14px;border:1.5px solid #e2e8f0;border-radius:8px;font-size:14px;outline:none;transition:border-color .2s;box-sizing:border-box;" />
+        <div id="sightSearchCount" style="font-size:12px;color:#94a3b8;margin-top:6px;">共 ${available.length} 个可添加景点</div>
+      </div>
+      <div class="modal-body" id="sightListContainer" style="padding:8px 24px 24px;overflow-y:auto;flex:1;">
+        ${renderSightList(available)}
       </div>
     </div>`;
 
     document.body.appendChild(overlay);
 
+    // 搜索过滤
+    const searchInput = overlay.querySelector('#sightSearchInput');
+    const listContainer = overlay.querySelector('#sightListContainer');
+    const countEl = overlay.querySelector('#sightSearchCount');
+
+    searchInput.addEventListener('input', () => {
+      const keyword = searchInput.value.trim().toLowerCase();
+      const filtered = keyword ? available.filter(s => s.name.toLowerCase().includes(keyword) || (s.type && s.type.toLowerCase().includes(keyword))) : available;
+      listContainer.innerHTML = renderSightList(filtered);
+      countEl.textContent = keyword ? `找到 ${filtered.length} 个景点` : `共 ${available.length} 个可添加景点`;
+      // 重新绑定点击事件
+      bindSightItemEvents(overlay, filtered, dayIdx);
+    });
+
+    searchInput.addEventListener('focus', () => searchInput.style.borderColor = '#2563eb');
+    searchInput.addEventListener('blur', () => searchInput.style.borderColor = '#e2e8f0');
+
     // 关闭
     overlay.querySelector('.modal-close').addEventListener('click', () => overlay.remove());
     overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
 
-    // 选择景点
+    // 绑定景点点击事件
+    bindSightItemEvents(overlay, available, dayIdx);
+  }
+
+  // 绑定添加景点弹窗中的景点项点击事件
+  function bindSightItemEvents(overlay, sightList, dayIdx) {
     overlay.querySelectorAll('.add-sight-item').forEach(el => {
       el.addEventListener('mouseenter', () => el.style.background = '#eff6ff');
       el.addEventListener('mouseleave', () => el.style.background = '');
       el.addEventListener('click', () => {
         const idx = parseInt(el.dataset.idx);
-        const sight = available[idx];
+        const sight = sightList[idx];
         addSightToDay(dayIdx, sight);
         overlay.remove();
       });
@@ -2689,6 +2727,245 @@
     drawRouteSegments(itineraryData);
 
     showToast(`已添加「${sight.name}」到第 ${dayIdx + 1} 天`, 'success', 2000);
+  }
+
+  // ========== 智能优化当前行程路线 ==========
+  // 提取当前行程中所有景点，重新聚类 + 最近邻 + 2-opt 优化，生成最短路线行程
+  async function optimizeCurrentItinerary() {
+    if (!itineraryData || !itineraryData.schedule) return;
+
+    showToast('正在智能优化路线...', 'info', 2000);
+
+    // 1. 从当前行程中提取所有景点（排除交通、到达、住宿、返程、餐饮）
+    const allSights = [];
+    itineraryData.schedule.forEach(day => {
+      day.items.forEach(item => {
+        if (item.lat && item.lng && !['到达', '住宿', '返程', '餐饮', '交通'].includes(item.tag)) {
+          // 尝试从 poiCache 中找到完整的景点信息
+          const poiData = poiCache[currentCity];
+          let fullSight = null;
+          if (poiData && poiData.sights) {
+            fullSight = poiData.sights.find(s => s.name === item.name);
+          }
+          allSights.push(fullSight || {
+            name: item.name,
+            lat: item.lat,
+            lng: item.lng,
+            type: item.tag || '景点',
+            price: 0,
+            duration: '1.5-2.5小时',
+            durationMinutes: 120,
+            desc: item.desc
+          });
+        }
+      });
+    });
+
+    if (allSights.length === 0) {
+      showToast('当前行程中没有景点可优化', 'warning');
+      return;
+    }
+
+    // 去重（按名称）
+    const uniqueSights = [];
+    const seenNames = new Set();
+    for (const s of allSights) {
+      if (!seenNames.has(s.name)) {
+        seenNames.add(s.name);
+        uniqueSights.push(s);
+      }
+    }
+
+    try {
+      // 2. 获取城市信息和到达方式
+      const cityInfo = await getCityData(currentCity);
+      if (!cityInfo) {
+        showToast('城市数据不存在，无法优化', 'error');
+        return;
+      }
+      const arrival = cityInfo.arrivals[arrivalSelect.value || 0];
+      const poiData = poiCache[currentCity];
+      const hotels = (poiData && poiData.hotels) ? [...poiData.hotels] : [];
+      const budgetCfg = BUDGET_CONFIG[budget];
+
+      // 3. 用候选酒店作为聚类参考点
+      const hotelCandidates = filterHotelsByBudget(hotels, budget);
+      const tempHotel = hotelCandidates[0] || hotels[0] || { lat: arrival.lat, lng: arrival.lng, price: 0, name: '默认住宿' };
+
+      // 4. 时间常量
+      const DAY_START_FIRST = 13 * 60;
+      const DAY_START_NORMAL = 9 * 60;
+      const DAY_END = 20 * 60;
+      const DAY_END_LAST = 18 * 60;
+      const MAX_DAY_MINUTES = 12 * 60;
+
+      // 5. 地理聚类：将景点分配到每天
+      let dailySights = clusterSightsByDay(uniqueSights, days, tempHotel, arrival);
+
+      // 6. 为每天独立选择酒店
+      const dailyHotels = selectDailyHotels(dailySights, hotels, budget, days);
+
+      // 7. 每天内部用最近邻 + 2-opt 优化排序
+      for (let d = 0; d < dailySights.length; d++) {
+        const dayHotel = dailyHotels[d] || tempHotel;
+        const startPoint = d === 0 ? arrival : dayHotel;
+        dailySights[d] = sortByNearestNeighbor(dailySights[d], startPoint);
+      }
+
+      // 8. 时间校验：超时景点移到下一天
+      for (let d = 0; d < dailySights.length; d++) {
+        const dayStart = d === 0 ? DAY_START_FIRST : DAY_START_NORMAL;
+        const dayEnd = d === days - 1 ? DAY_END_LAST : DAY_END;
+        let currentMinute = dayStart;
+        const dayHotel = dailyHotels[d] || tempHotel;
+        let prevPoint = d === 0 ? arrival : dayHotel;
+        const kept = [];
+        const overflow = [];
+
+        for (const sight of dailySights[d]) {
+          const transit = estimateTransitTime(prevPoint.lat, prevPoint.lng, sight.lat, sight.lng);
+          const visitMin = sight.durationMinutes || 120;
+          const needed = transit.minutes + visitMin;
+
+          if (currentMinute + needed <= dayEnd && currentMinute + needed - dayStart <= MAX_DAY_MINUTES) {
+            currentMinute += needed;
+            prevPoint = sight;
+            kept.push(sight);
+          } else {
+            overflow.push(sight);
+          }
+        }
+
+        dailySights[d] = kept;
+        if (overflow.length > 0 && d + 1 < dailySights.length) {
+          dailySights[d + 1] = [...overflow, ...dailySights[d + 1]];
+        }
+      }
+
+      // 9. 重新生成行程数据（复用 generateItinerary 的行程生成逻辑）
+      const schedule = [];
+      let totalTicket = 0;
+      const usedRestaurants = new Set();
+
+      for (let d = 0; d < days; d++) {
+        const isFirstDay = d === 0;
+        const isLastDay = d === days - 1;
+        const todaySights = dailySights[d] || [];
+        const todayHotel = dailyHotels[d];
+        const prevDayHotel = d > 0 ? dailyHotels[d - 1] : null;
+        const dayPlan = { day: d + 1, items: [] };
+
+        let currentMinute = isFirstDay ? 13 * 60 : 9 * 60;
+        let prevPoint;
+
+        // 第一天：到达
+        if (isFirstDay) {
+          dayPlan.items.push({ time: '09:00', name: arrival.name, desc: `抵达${currentCity}，${arrival.type}`, tag: '到达', lat: arrival.lat, lng: arrival.lng });
+          if (todayHotel) {
+            dayPlan.items.push({ time: minutesToTime(currentMinute), name: todayHotel.name, desc: `办理入住 · ≈¥${todayHotel.price}/晚`, tag: '住宿', lat: todayHotel.lat, lng: todayHotel.lng });
+          }
+          prevPoint = todayHotel || arrival;
+        } else {
+          // 非第一天：退房 + 交通到今日酒店
+          if (prevDayHotel) {
+            dayPlan.items.push({ time: minutesToTime(currentMinute), name: prevDayHotel.name, desc: '退房，携带行李出发', tag: '住宿', lat: prevDayHotel.lat, lng: prevDayHotel.lng });
+          }
+          if (todayHotel && prevDayHotel && todayHotel.name !== prevDayHotel.name) {
+            const transitToHotel = estimateTransitTime(prevDayHotel.lat, prevDayHotel.lng, todayHotel.lat, todayHotel.lng);
+            dayPlan.items.push({
+              time: minutesToTime(currentMinute),
+              name: `🚗 前往${todayHotel.name}`,
+              desc: `${transitToHotel.mode} · 约${transitToHotel.minutes}分钟`,
+              tag: '交通'
+            });
+            currentMinute += transitToHotel.minutes;
+            dayPlan.items.push({ time: minutesToTime(currentMinute), name: todayHotel.name, desc: `寄存行李 · ≈¥${todayHotel.price}/晚`, tag: '住宿', lat: todayHotel.lat, lng: todayHotel.lng });
+          }
+          prevPoint = todayHotel || prevDayHotel || arrival;
+        }
+
+        // 景点游览
+        for (const sight of todaySights) {
+          const transit = estimateTransitTime(prevPoint.lat, prevPoint.lng, sight.lat, sight.lng);
+          dayPlan.items.push({
+            time: minutesToTime(currentMinute),
+            name: `🚗 前往${sight.name}`,
+            desc: `${transit.mode} · 约${transit.minutes}分钟`,
+            tag: '交通'
+          });
+          currentMinute += transit.minutes;
+
+          const visitMin = sight.durationMinutes || 120;
+          const priceLabel = sight.price === 0 ? '免费' : (sight.priceSource === 'estimated' ? '≈¥' + sight.price : '¥' + sight.price);
+          dayPlan.items.push({
+            time: minutesToTime(currentMinute),
+            name: sight.name,
+            desc: `${sight.type} · ${sight.duration || '约2小时'} · ${priceLabel}`,
+            tag: sight.type || '景点',
+            lat: sight.lat,
+            lng: sight.lng
+          });
+          if (sight.price) totalTicket += sight.price;
+          currentMinute += visitMin;
+          prevPoint = sight;
+        }
+
+        // 晚餐
+        const dinnerTime = Math.max(currentMinute, 18 * 60);
+        dayPlan.items.push({ time: minutesToTime(dinnerTime), name: `推荐品尝${currentCity}特色美食`, desc: `餐饮预算 ≈ ¥${budgetCfg.food}`, tag: '餐饮' });
+
+        // 返回酒店 / 返程
+        if (!isLastDay && todayHotel) {
+          dayPlan.items.push({ time: minutesToTime(dinnerTime + 90), name: todayHotel.name, desc: '返回酒店休息', tag: '住宿', lat: todayHotel.lat, lng: todayHotel.lng });
+        } else if (isLastDay) {
+          const toArrival = estimateTransitTime(prevPoint.lat, prevPoint.lng, arrival.lat, arrival.lng);
+          const departTime = dinnerTime + 60;
+          dayPlan.items.push({
+            time: minutesToTime(departTime),
+            name: `🚗 前往${arrival.name}`,
+            desc: `${toArrival.mode} · 约${toArrival.minutes}分钟，预留充足时间`,
+            tag: '交通'
+          });
+          dayPlan.items.push({
+            time: minutesToTime(departTime + toArrival.minutes),
+            name: arrival.name,
+            desc: `抵达${arrival.type}，结束愉快旅程`,
+            tag: '返程', lat: arrival.lat, lng: arrival.lng
+          });
+        }
+
+        schedule.push(dayPlan);
+      }
+
+      // 10. 计算费用
+      let totalHotelCost = 0;
+      for (const h of dailyHotels) {
+        if (h) totalHotelCost += h.price;
+      }
+      if (totalHotelCost === 0 && days === 1) totalHotelCost = 0;
+
+      // 11. 更新行程数据
+      itineraryData = {
+        schedule,
+        dailyHotels,
+        cost: {
+          hotel: totalHotelCost,
+          food: budgetCfg.food * days,
+          transport: budgetCfg.transport * days,
+          ticket: totalTicket
+        }
+      };
+
+      // 12. 重新渲染
+      renderItinerary(itineraryData);
+      renderCostSummary(itineraryData);
+      drawRouteSegments(itineraryData);
+
+      showToast('✅ 路线已智能优化，景点按最短路线重新排列', 'success', 3000);
+    } catch (e) {
+      console.error('智能优化失败:', e);
+      showToast('优化失败：' + e.message, 'error', 3000);
+    }
   }
 
   // ========== 路线分段绘制 ==========

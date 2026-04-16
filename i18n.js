@@ -39,7 +39,8 @@
       'btn.save': '保存行程',
       'btn.share': '分享行程',
       'btn.exportPdf': '导出PDF',
-      'btn.optimize': '🔄 一键优化路线',
+      'btn.randomPlan': '🎲 随机规划',
+      'btn.smartOptimize': '🧠 智能优化路线',
       'btn.addSight': '+ 添加景点',
 
       // ---- 费用统计 ----
@@ -85,7 +86,9 @@
       'toast.sightRemoved': '已移除景点',
       'toast.sightAdded': '已添加「{name}」到第 {day} 天',
       'toast.orderChanged': '行程顺序已调整',
-      'toast.optimizing': '正在重新优化路线...',
+      'toast.randomPlanning': '正在重新随机规划...',
+      'toast.smartOptimizing': '正在智能优化路线...',
+      'toast.smartOptimized': '✅ 路线已智能优化，景点按最短路线重新排列',
       'toast.saved': '行程已保存',
       'toast.linkCopied': '分享链接已复制到剪贴板',
       'toast.offline': '当前处于离线状态，部分功能可能不可用',
