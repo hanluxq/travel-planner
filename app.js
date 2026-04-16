@@ -196,8 +196,27 @@
     cityInput.value = '';
   }
 
+  // Check if the browser supports WebGL (required by TMap GL JS)
+  function detectWebGL() {
+    try {
+      const canvas = document.createElement('canvas');
+      const gl = canvas.getContext('webgl2')
+        || canvas.getContext('webgl')
+        || canvas.getContext('experimental-webgl');
+      if (gl) {
+        // Clean up context to free resources
+        const ext = gl.getExtension('WEBGL_lose_context');
+        if (ext) ext.loseContext();
+        return true;
+      }
+    } catch (e) {
+      // Ignore — treat as unsupported
+    }
+    return false;
+  }
+
   function initMap() {
-    // 检测腾讯地图 SDK 是否加载成功
+    // 1. Check TMap SDK loaded
     if (typeof TMap === 'undefined') {
       console.error('腾讯地图 SDK 未加载');
       mapContainer.innerHTML = `<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;color:#64748b;font-size:16px;gap:12px;padding:20px;text-align:center;">
@@ -206,6 +225,32 @@
         <p>腾讯地图 SDK 未能加载，可能是网络问题。</p>
         <button onclick="location.reload()" style="padding:10px 24px;background:#2563eb;color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;">刷新重试</button>
       </div>`;
+      return;
+    }
+
+    // 2. Check WebGL support before creating the map
+    if (!detectWebGL()) {
+      console.error('当前浏览器/环境不支持 WebGL');
+      mapContainer.innerHTML = `<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;color:#64748b;font-size:16px;gap:12px;padding:20px;text-align:center;">
+        <span style="font-size:48px;">⚠️</span>
+        <p style="font-weight:700;font-size:18px;color:#0f172a;">地图初始化失败</p>
+        <p>当前浏览器不支持 WebGL，腾讯地图 GL 版需要 WebGL 才能运行。</p>
+        <p style="font-size:13px;color:#94a3b8;line-height:1.6;">
+          请尝试以下操作：<br>
+          1. 使用 Chrome / Edge / Firefox 等现代浏览器<br>
+          2. 在浏览器设置中开启「硬件加速」<br>
+          3. 更新显卡驱动程序
+        </p>
+        <button onclick="location.reload()" style="padding:10px 24px;background:#2563eb;color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;">刷新重试</button>
+      </div>`;
+      return;
+    }
+
+    // 3. Ensure the container has non-zero dimensions
+    const rect = mapContainer.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) {
+      console.warn('mapContainer 尺寸为 0，延迟初始化地图');
+      requestAnimationFrame(() => initMap());
       return;
     }
 
@@ -218,10 +263,15 @@
       });
     } catch (e) {
       console.error('地图初始化失败:', e);
+      const isWebGLError = e.message
+        && e.message.indexOf('isWebGL') !== -1;
+      const hint = isWebGLError
+        ? '当前环境 WebGL 上下文创建失败，请开启浏览器硬件加速或更换浏览器。'
+        : (e.message || '请刷新页面重试');
       mapContainer.innerHTML = `<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;color:#64748b;font-size:16px;gap:12px;padding:20px;text-align:center;">
         <span style="font-size:48px;">⚠️</span>
         <p style="font-weight:700;font-size:18px;color:#0f172a;">地图初始化失败</p>
-        <p>${e.message || '请刷新页面重试'}</p>
+        <p>${hint}</p>
         <button onclick="location.reload()" style="padding:10px 24px;background:#2563eb;color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;">刷新重试</button>
       </div>`;
     }
