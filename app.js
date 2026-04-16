@@ -169,8 +169,6 @@
     bindEvents();
     updateBudgetDetail();
     initOfflineDetection();
-    // 首次访问新手引导
-    setTimeout(() => showOnboarding(), 1500);
     // 延迟加载 POI，等地图 SDK 完全就绪
     setTimeout(() => {
       // 优先从 URL 恢复行程
@@ -2985,117 +2983,6 @@
     }
     showToast('正在准备打印...', 'info', 2000);
     setTimeout(() => window.print(), 500);
-  }
-
-  // ========== 新手引导 ==========
-  const ONBOARDING_KEY = 'travel_onboarding_done';
-
-  function showOnboarding() {
-    // 已完成引导则跳过
-    if (localStorage.getItem(ONBOARDING_KEY)) return;
-
-    const steps = [
-      { target: '#citySelect', title: '① 选择目的地', desc: '从热门城市中选择，或搜索任意地点', position: 'right' },
-      { target: '#daysValue', title: '② 设置天数与预算', desc: '调整行程天数和预算档位', position: 'right' },
-      { target: '#planBtn', title: '③ 开始规划', desc: '点击按钮，AI 智能生成专属行程', position: 'right' },
-      { target: '#mapContainer', title: '④ 查看地图与行程', desc: '在地图上查看景点分布，右侧面板查看详细行程', position: 'center' }
-    ];
-
-    let currentStep = 0;
-
-    // 创建遮罩层
-    const overlay = document.createElement('div');
-    overlay.className = 'onboarding-overlay';
-    overlay.innerHTML = `
-      <div class="onboarding-card" id="onboardingCard">
-        <div class="onboarding-step-indicator" id="onboardingIndicator"></div>
-        <h3 class="onboarding-title" id="onboardingTitle"></h3>
-        <p class="onboarding-desc" id="onboardingDesc"></p>
-        <div class="onboarding-actions">
-          <button class="onboarding-skip" id="onboardingSkip">跳过</button>
-          <button class="onboarding-next" id="onboardingNext">下一步</button>
-        </div>
-      </div>
-    `;
-    document.body.appendChild(overlay);
-
-    function renderStep() {
-      const step = steps[currentStep];
-      const card = document.getElementById('onboardingCard');
-      const indicator = document.getElementById('onboardingIndicator');
-      const title = document.getElementById('onboardingTitle');
-      const desc = document.getElementById('onboardingDesc');
-      const nextBtn = document.getElementById('onboardingNext');
-
-      // 步骤指示器
-      indicator.innerHTML = steps.map((_, i) =>
-        `<span class="onboarding-dot${i === currentStep ? ' active' : ''}"></span>`
-      ).join('');
-
-      title.textContent = step.title;
-      desc.textContent = step.desc;
-      nextBtn.textContent = currentStep === steps.length - 1 ? '开始使用 🚀' : '下一步';
-
-      // 高亮目标元素
-      const targetEl = document.querySelector(step.target);
-      if (targetEl && step.position !== 'center') {
-        const rect = targetEl.getBoundingClientRect();
-        const cardWidth = 320; // 与 CSS 中 .onboarding-card width 一致
-        const sidebar = document.querySelector('.sidebar');
-        const sidebarRight = sidebar ? sidebar.getBoundingClientRect().right : 0;
-        // 弹窗左边缘至少在 sidebar 右侧 + 16px
-        let cardLeft = Math.max(rect.right + 16, sidebarRight + 16);
-        // 如果弹窗超出屏幕右边界，改为屏幕居中显示
-        if (cardLeft + cardWidth > window.innerWidth - 16) {
-          cardLeft = Math.max(sidebarRight + 16, (window.innerWidth - cardWidth) / 2);
-        }
-        card.style.position = 'fixed';
-        card.style.top = Math.min(rect.top, window.innerHeight - 200) + 'px';
-        card.style.left = cardLeft + 'px';
-        card.style.transform = 'none';
-        targetEl.style.position = 'relative';
-        targetEl.style.zIndex = '60001';
-        targetEl.style.boxShadow = '0 0 0 4px rgba(37,99,235,.4), 0 0 20px rgba(37,99,235,.2)';
-        targetEl.style.borderRadius = '8px';
-      } else {
-        card.style.position = 'fixed';
-        card.style.top = '50%';
-        card.style.left = '50%';
-        card.style.transform = 'translate(-50%, -50%)';
-      }
-    }
-
-    function clearHighlights() {
-      steps.forEach(step => {
-        const el = document.querySelector(step.target);
-        if (el) {
-          el.style.zIndex = '';
-          el.style.boxShadow = '';
-          el.style.borderRadius = '';
-          el.style.position = '';
-        }
-      });
-    }
-
-    function finish() {
-      clearHighlights();
-      overlay.classList.add('onboarding-fade-out');
-      setTimeout(() => { if (overlay.parentNode) overlay.remove(); }, 300);
-      localStorage.setItem(ONBOARDING_KEY, '1');
-    }
-
-    document.getElementById('onboardingSkip').addEventListener('click', finish);
-    document.getElementById('onboardingNext').addEventListener('click', () => {
-      clearHighlights();
-      currentStep++;
-      if (currentStep >= steps.length) {
-        finish();
-      } else {
-        renderStep();
-      }
-    });
-
-    renderStep();
   }
 
   document.addEventListener('DOMContentLoaded', init);
