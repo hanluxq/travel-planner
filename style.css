@@ -1520,13 +1520,15 @@ button:focus-visible, select:focus-visible, input:focus-visible {
       background: var(--c-primary-hover);
       transform: translateY(-1px);
       box-shadow: 0 4px 12px rgba(37, 99, 235, .35);
-    
-        @media (max-width: 768px) {
-          .onboarding-card {
-            position: fixed !important;
-            bottom: 20px !important;
-            left: 50% !important;
-            top: auto !important;
-            transform: translateX(-50%) !important;
-            width: 90vw;
-}
+    }
+
+    @media (max-width: 768px) {
+      .onboarding-card {
+        position: fixed !important;
+        bottom: 20px !important;
+        left: 50% !important;
+        top: auto !important;
+        transform: translateX(-50%) !important;
+        width: 90vw;
+      }
+    }
